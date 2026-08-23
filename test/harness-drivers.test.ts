@@ -16,6 +16,7 @@ import {
 } from "../pi-extension/subagents/harness/index.ts";
 import type { ResolvedRuntimePlan } from "../pi-extension/subagents/runtime-routing.ts";
 import type { SubagentResultContext } from "../pi-extension/subagents/harness/types.ts";
+import { appendSubagentLineage, createRootLineage } from "../pi-extension/subagents/lineage.ts";
 
 function createMockLaunchContext(overrides?: Partial<SubagentLaunchContext>): SubagentLaunchContext {
   const runtimePlan: ResolvedRuntimePlan = {
@@ -46,6 +47,11 @@ function createMockLaunchContext(overrides?: Partial<SubagentLaunchContext>): Su
     effectiveInteractive: false,
     inheritsConversationContext: true,
     taskDelivery: "direct",
+    lineage: appendSubagentLineage(createRootLineage("root", "/tmp/root.jsonl"), {
+      id: "abc12345",
+      name: "worker",
+      sessionFile: "/tmp/sessions/subagent.jsonl",
+    }),
     subagentsDir: "/path/to/subagents",
     shellQuote: (s: string) => `'${s.replace(/'/g, "'\\''")}'`,
     ...overrides,
@@ -134,6 +140,8 @@ describe("Pi Harness Driver", () => {
     assert.ok(built.command.includes("pi --session '/tmp/sessions/subagent.jsonl'"));
     assert.ok(built.command.includes("--model 'anthropic/claude-sonnet-4-5'"));
     assert.ok(built.command.includes("--thinking 'high'"));
+    assert.ok(built.command.includes("PI_SUBAGENT_DEPTH='1'"));
+    assert.ok(built.command.includes("PI_SUBAGENT_LINEAGE='{\"version\":1"));
     assert.ok(built.command.includes("echo '__SUBAGENT_DONE_'$?'__'"));
   });
 });

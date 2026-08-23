@@ -127,7 +127,9 @@ Agents default to running with `pi`, but can run inside any supported harness CL
 5. Main agent processes result     → continues with new context
 ```
 
-Multiple subagents run concurrently — each steers its result back independently as it finishes. The live widget above the input tracks every agent still in flight:
+Multiple subagents run concurrently — each steers its result back independently as it finishes. Recursive delegation is also supported. Every child receives an immutable root-to-self lineage, including its numeric recursion depth, through `PI_SUBAGENT_LINEAGE` and `PI_SUBAGENT_DEPTH`; the same identity is injected into its task and subagent-tool guidance. A child can therefore decide whether another layer is useful with full knowledge of how deeply nested it already is. The lineage is appended—not reset—when that child delegates again, and is persisted in the child session header as `subagentLineage` / `subagentDepth`.
+
+The live widget above the input tracks every agent still in flight:
 
 ```
 ╭─ Subagents ──────────────────── 1 active · 2 open ─╮
@@ -372,7 +374,7 @@ Discovery still resolves precedence before visibility filtering. If a project-lo
 
 Choose how a subagent session starts:
 
-- `standalone` — default fresh session with no lineage link to the caller
+- `standalone` — default fresh session with no copied turns or canonical `parentSession` link; delegation identity is still persisted in `subagentLineage`
 - `lineage-only` — fresh blank child session with `parentSession` linkage, but no copied turns from the caller
 - `fork` — linked child session seeded with the caller's prior conversation context
 

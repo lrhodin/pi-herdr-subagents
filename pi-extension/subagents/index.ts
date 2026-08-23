@@ -40,12 +40,23 @@ import {
   buildPiPromptArgs,
 } from "./harness/index.ts";
 import { loadModelConfig, resolveModelDefault, type ModelConfig } from "./model-config.ts";
+import {
+  appendSubagentLineage,
+  createRootLineage,
+  formatSubagentIdentity,
+  prependSubagentIdentity,
+  readSubagentLineageFromEnvironment,
+  serializeSubagentLineage,
+  type SubagentLineage,
+} from "./lineage.ts";
 
 import {
   findLastAssistantMessage,
   findObservedSessionRuntime,
   getNewEntries,
+  readSubagentLineageFromSessionFile,
   seedSubagentSessionFile,
+  writeSubagentLineageToSessionFile,
 } from "./session.ts";
 import {
   type SubagentStatusState,
@@ -105,8 +116,10 @@ const RUNTIME_KEY = Symbol.for("pi-subagents/runtime");
 function buildSubagentRoutingGuidelines(
   modelCatalog?: string,
   agentCatalog?: string,
+  lineage?: SubagentLineage | null,
 ): string[] {
   return [
+    ...(lineage ? [formatSubagentIdentity(lineage)] : []),
     "Choose the named agent whose description most closely matches the task; do not use one agent as a generic default.",
     "Omit model and thinking when invoking a named agent so its configured defaults apply. Passing either field is an explicit one-off override and takes precedence over agent frontmatter.",
     "For a bare spawn, omit model and thinking to inherit the parent runtime.",
@@ -117,7 +130,12 @@ function buildSubagentRoutingGuidelines(
   ];
 }
 
-const subagentRoutingGuidelines = buildSubagentRoutingGuidelines();
+const inheritedLineage = readSubagentLineageFromEnvironment();
+const subagentRoutingGuidelines = buildSubagentRoutingGuidelines(
+  undefined,
+  undefined,
+  inheritedLineage,
+);
 
 const ThinkingLevelSchema = Type.Union(
   THINKING_LEVELS.map((level) => Type.Literal(level)),
@@ -413,7 +431,7 @@ function resolveLaunchBehavior(
   agentDefs: AgentDefaults | null,
 ): {
   sessionMode: SubagentSessionMode;
-  seededSessionMode: "lineage-only" | "fork" | null;
+  seededSessionMode: SubagentSessionMode;
   inheritsConversationContext: boolean;
   taskDelivery: "direct" | "artifact";
 } {
@@ -421,7 +439,9 @@ function resolveLaunchBehavior(
   const inheritsConversationContext = sessionMode === "fork";
   return {
     sessionMode,
-    seededSessionMode: sessionMode === "standalone" ? null : sessionMode,
+    // Seed even context-standalone sessions so delegation lineage survives
+    // process exits and future inspection. Only fork mode copies conversation.
+    seededSessionMode: sessionMode,
     inheritsConversationContext,
     taskDelivery: inheritsConversationContext ? "direct" : "artifact",
   };
@@ -603,6 +623,8 @@ interface RunningSubagent {
   interactive: boolean;
   /** Parent-resolved model/thinking selection and provenance. */
   runtimePlan: ResolvedRuntimePlan | undefined;
+  /** Immutable root-to-this-agent delegation identity. */
+  lineage: SubagentLineage;
 }
 
 interface SubagentRuntime {
@@ -611,6 +633,7 @@ interface SubagentRuntime {
   latestCtx?: ExtensionContext;
   modelCatalog?: string;
   agentCatalog?: string;
+  currentLineage?: SubagentLineage;
 }
 
 function createSubagentRuntime(): SubagentRuntime {
@@ -1157,6 +1180,15 @@ async function launchSubagent(
     Math.random().toString(16).slice(2, 6),
   ].join("-");
   const subagentSessionFile = join(sessionDir, `${timestamp}_${uuid}.jsonl`);
+  const parentLineage = runtime.currentLineage ??
+    readSubagentLineageFromEnvironment() ??
+    createRootLineage(sessionId, sessionFile);
+  const childLineage = appendSubagentLineage(parentLineage, {
+    id,
+    name: params.name,
+    sessionFile: subagentSessionFile,
+    ...(params.agent ? { agent: params.agent } : {}),
+  });
 
   const cliId = agentDefs?.cli ?? "pi";
   const driver = getHarnessDriver(cliId);
@@ -1173,14 +1205,13 @@ async function launchSubagent(
 
   const launchBehavior = resolveLaunchBehavior(params, agentDefs);
 
-  if (launchBehavior.seededSessionMode) {
-    seedSubagentSessionFile({
-      mode: launchBehavior.seededSessionMode,
-      parentSessionFile: sessionFile,
-      childSessionFile: subagentSessionFile,
-      childCwd: targetCwdForSession,
-    });
-  }
+  seedSubagentSessionFile({
+    mode: launchBehavior.seededSessionMode,
+    parentSessionFile: sessionFile,
+    childSessionFile: subagentSessionFile,
+    childCwd: targetCwdForSession,
+    lineage: childLineage,
+  });
 
   const activityFile = getSubagentActivityFile(artifactDir, id);
   if (driver.hasActivitySnapshots) {
@@ -1205,7 +1236,11 @@ async function launchSubagent(
   const effectiveModel = driver.formatModel(runtimePlan);
 
   const built = driver.buildCommand({
-    params: { ...params, id },
+    params: {
+      ...params,
+      id,
+      task: prependSubagentIdentity(params.task, childLineage),
+    },
     agentDefs,
     runtimePlan,
     effectiveModel,
@@ -1228,6 +1263,7 @@ async function launchSubagent(
     roleBlock,
     modeHint,
     summaryInstruction,
+    lineage: childLineage,
     subagentsDir: SUBAGENTS_DIR,
     shellQuote,
   });
@@ -1262,6 +1298,7 @@ async function launchSubagent(
     sentinelFile: built.sentinelFile,
     interactive: effectiveInteractive,
     runtimePlan,
+    lineage: childLineage,
     activityFile: driver.hasActivitySnapshots ? activityFile : undefined,
     lifecycle: !driver.hasActivitySnapshots
       ? markProcessRunning(createLifecycle(startTime), Date.now())
@@ -1435,6 +1472,16 @@ export default function subagentsExtension(pi: ExtensionAPI) {
   // subagents whose watchers survived a reload.
   pi.on("session_start", (_event, ctx) => {
     runtime.latestCtx = ctx;
+    const currentSessionFile = ctx.sessionManager?.getSessionFile?.();
+    const currentSessionId = ctx.sessionManager?.getSessionId?.();
+    const persistedLineage = currentSessionFile
+      ? readSubagentLineageFromSessionFile(currentSessionFile)
+      : null;
+    runtime.currentLineage = inheritedLineage ?? persistedLineage ?? (
+      currentSessionFile && currentSessionId
+        ? createRootLineage(currentSessionId, currentSessionFile)
+        : undefined
+    );
     runtime.modelCatalog = buildAuthenticatedModelCatalog(wrapPiModelRegistry(ctx.modelRegistry));
     runtime.agentCatalog = buildAvailableAgentCatalog(
       discoverAgentDefinitions().filter((agent) => !agent.disableModelInvocation),
@@ -1442,6 +1489,7 @@ export default function subagentsExtension(pi: ExtensionAPI) {
     const refreshedGuidelines = buildSubagentRoutingGuidelines(
       runtime.modelCatalog,
       runtime.agentCatalog,
+      runtime.currentLineage,
     );
     subagentRoutingGuidelines.splice(0, subagentRoutingGuidelines.length, ...refreshedGuidelines);
     if (runningSubagents.size > 0) {
@@ -1500,20 +1548,6 @@ export default function subagentsExtension(pi: ExtensionAPI) {
       parameters: SubagentParams,
 
       async execute(_toolCallId, params, _signal, _onUpdate, ctx) {
-        // Prevent self-spawning (e.g. planner spawning another planner)
-        const currentAgent = process.env.PI_SUBAGENT_AGENT;
-        if (params.agent && currentAgent && params.agent === currentAgent) {
-          return {
-            content: [
-              {
-                type: "text",
-                text: `You are the ${currentAgent} agent — do not start another ${currentAgent}. You were spawned to do this work yourself. Complete the task directly.`,
-              },
-            ],
-            details: { error: "self-spawn blocked" },
-          };
-        }
-
         // Validate prerequisites
         if (!isTerminalAvailable()) {
           return muxUnavailableResult();
@@ -1609,6 +1643,8 @@ export default function subagentsExtension(pi: ExtensionAPI) {
                   ...(result.errorMessage ? { errorMessage: result.errorMessage } : {}),
                   ...(result.claudeSessionId ? { claudeSessionId: result.claudeSessionId } : {}),
                   ...(running.runtimePlan ? { runtimePlan: running.runtimePlan } : {}),
+                  depth: running.lineage.chain.length,
+                  lineage: running.lineage,
                 },
               },
               { triggerTurn: true, deliverAs: "steer" },
@@ -1657,6 +1693,8 @@ export default function subagentsExtension(pi: ExtensionAPI) {
             model: running.runtimePlan?.model,
             thinking: running.runtimePlan?.thinking,
             runtimePlan: running.runtimePlan,
+            depth: running.lineage.chain.length,
+            lineage: running.lineage,
             status: "started",
           },
         };
@@ -1900,6 +1938,21 @@ export default function subagentsExtension(pi: ExtensionAPI) {
         const { autoExit, interactive } = resolveResumeLaunchBehavior(params);
         const startTime = Date.now();
         const id = Math.random().toString(16).slice(2, 10);
+        const parentSessionFile = ctx.sessionManager.getSessionFile();
+        if (!parentSessionFile) {
+          return {
+            content: [{ type: "text", text: "Error: no parent session file. Start pi with a persistent session to resume subagents." }],
+            details: { error: "no session file" },
+          };
+        }
+        const parentLineage = runtime.currentLineage ??
+          readSubagentLineageFromEnvironment() ??
+          createRootLineage(ctx.sessionManager.getSessionId(), parentSessionFile);
+        const resumeLineage = appendSubagentLineage(parentLineage, {
+          id,
+          name,
+          sessionFile: params.sessionPath,
+        });
 
         if (!isTerminalAvailable()) {
           return muxUnavailableResult();
@@ -1914,8 +1967,10 @@ export default function subagentsExtension(pi: ExtensionAPI) {
           };
         }
 
-        // Record entry count before resuming so we can extract new messages
+        // Record entry count before resuming so we can extract new messages,
+        // then persist the new execution lineage for future Herdr restoration.
         const entryCountBefore = getNewEntries(params.sessionPath, 0).length;
+        writeSubagentLineageToSessionFile(params.sessionPath, resumeLineage);
 
         const surface = createSubagentPane(name);
         if (params.message) {
@@ -1949,7 +2004,11 @@ export default function subagentsExtension(pi: ExtensionAPI) {
               .replace(/^-|-$/g, "") || "resume"}-${msgTimestamp}.md`,
           );
           mkdirSync(dirname(resumeMsgFile), { recursive: true });
-          writeFileSync(resumeMsgFile, params.message, "utf8");
+          writeFileSync(
+            resumeMsgFile,
+            prependSubagentIdentity(params.message, resumeLineage),
+            "utf8",
+          );
           parts.push(shellQuote(`@${resumeMsgFile}`));
         }
 
@@ -1961,6 +2020,8 @@ export default function subagentsExtension(pi: ExtensionAPI) {
         resumeEnvParts.push(`PI_SUBAGENT_NAME=${shellQuote(name)}`);
         resumeEnvParts.push(`PI_SUBAGENT_SESSION=${shellQuote(params.sessionPath)}`);
         resumeEnvParts.push(`PI_SUBAGENT_ID=${shellQuote(id)}`);
+        resumeEnvParts.push(`PI_SUBAGENT_DEPTH=${shellQuote(String(resumeLineage.chain.length))}`);
+        resumeEnvParts.push(`PI_SUBAGENT_LINEAGE=${shellQuote(serializeSubagentLineage(resumeLineage))}`);
         resumeEnvParts.push(`PI_SUBAGENT_ACTIVITY_FILE=${shellQuote(activityFile)}`);
         if (autoExit) {
           resumeEnvParts.push(`PI_SUBAGENT_AUTO_EXIT=1`);
@@ -2001,6 +2062,7 @@ export default function subagentsExtension(pi: ExtensionAPI) {
           activityFile,
           interactive,
           runtimePlan: undefined,
+          lineage: resumeLineage,
           lifecycle: createLifecycle(startTime),
         };
         runningSubagents.set(id, running);
@@ -2070,6 +2132,8 @@ export default function subagentsExtension(pi: ExtensionAPI) {
                   sessionFile: params.sessionPath,
                   ...(result.errorMessage ? { errorMessage: result.errorMessage } : {}),
                   ...(running.runtimePlan ? { runtimePlan: running.runtimePlan } : {}),
+                  depth: running.lineage.chain.length,
+                  lineage: running.lineage,
                 },
               },
               { triggerTurn: true, deliverAs: "steer" },

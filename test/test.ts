@@ -21,10 +21,22 @@ import {
   appendBranchSummary,
   copySessionFile,
   mergeNewEntries,
+  readSubagentLineageFromSessionFile,
   seedSubagentSessionFile,
+  writeSubagentLineageToSessionFile,
 } from "../pi-extension/subagents/session.ts";
 
 import { isHerdrAvailable, __herdrTest__ } from "../pi-extension/subagents/herdr.ts";
+import {
+  appendSubagentLineage,
+  createRootLineage,
+  formatSubagentIdentity,
+  parseSubagentLineage,
+  prependSubagentIdentity,
+  readSubagentLineageFromEnvironment,
+  serializeSubagentLineage,
+  validateSubagentLineage,
+} from "../pi-extension/subagents/lineage.ts";
 import {
   loadModelConfig,
   parseModelConfig,
@@ -71,15 +83,23 @@ import {
 // Isolate the unit suite from inherited parent/child capability variables.
 const inheritedSubagentId = process.env.PI_SUBAGENT_ID;
 const inheritedDenyTools = process.env.PI_DENY_TOOLS;
+const inheritedSubagentDepth = process.env.PI_SUBAGENT_DEPTH;
+const inheritedSubagentLineage = process.env.PI_SUBAGENT_LINEAGE;
 before(() => {
   delete process.env.PI_SUBAGENT_ID;
   delete process.env.PI_DENY_TOOLS;
+  delete process.env.PI_SUBAGENT_DEPTH;
+  delete process.env.PI_SUBAGENT_LINEAGE;
 });
 after(() => {
   if (inheritedSubagentId == null) delete process.env.PI_SUBAGENT_ID;
   else process.env.PI_SUBAGENT_ID = inheritedSubagentId;
   if (inheritedDenyTools == null) delete process.env.PI_DENY_TOOLS;
   else process.env.PI_DENY_TOOLS = inheritedDenyTools;
+  if (inheritedSubagentDepth == null) delete process.env.PI_SUBAGENT_DEPTH;
+  else process.env.PI_SUBAGENT_DEPTH = inheritedSubagentDepth;
+  if (inheritedSubagentLineage == null) delete process.env.PI_SUBAGENT_LINEAGE;
+  else process.env.PI_SUBAGENT_LINEAGE = inheritedSubagentLineage;
 });
 
 // --- Helpers ---
@@ -249,6 +269,80 @@ const TOOL_RESULT = {
 };
 
 // --- Tests ---
+
+describe("lineage.ts", () => {
+  it("builds and round-trips a complete root-to-child chain", () => {
+    const root = createRootLineage("root-session", "/sessions/root.jsonl");
+    const child = appendSubagentLineage(root, {
+      id: "child-1",
+      name: "linux-scout",
+      agent: "scout",
+      sessionFile: "/sessions/child-1.jsonl",
+    });
+    const grandchild = appendSubagentLineage(child, {
+      id: "child-2",
+      name: "kernel-scout",
+      sessionFile: "/sessions/child-2.jsonl",
+    });
+
+    assert.equal(grandchild.chain.length, 2);
+    assert.deepEqual(grandchild.chain.map((node) => node.depth), [1, 2]);
+    assert.deepEqual(parseSubagentLineage(serializeSubagentLineage(grandchild)), grandchild);
+  });
+
+  it("does not impose an arbitrary recursion-depth cap", () => {
+    let lineage = createRootLineage("root", "/root.jsonl");
+    for (let depth = 1; depth <= 256; depth++) {
+      lineage = appendSubagentLineage(lineage, {
+        id: `child-${depth}`,
+        name: `agent-${depth}`,
+        sessionFile: `/sessions/child-${depth}.jsonl`,
+      });
+    }
+    assert.equal(lineage.chain.length, 256);
+    assert.equal(parseSubagentLineage(serializeSubagentLineage(lineage)).chain.length, 256);
+  });
+
+  it("makes recursion depth and the full ancestry visible to the model", () => {
+    const lineage = appendSubagentLineage(
+      appendSubagentLineage(createRootLineage("root", "/root.jsonl"), {
+        id: "a",
+        name: "first",
+        sessionFile: "/first.jsonl",
+      }),
+      { id: "b", name: "second", sessionFile: "/second.jsonl" },
+    );
+    const identity = formatSubagentIdentity(lineage);
+    const task = prependSubagentIdentity("Inspect the driver.", lineage);
+
+    assert.match(identity, /recursion depth 2/);
+    assert.match(identity, /depth 0: root session root/);
+    assert.match(identity, /depth 1: first/);
+    assert.match(identity, /depth 2: second/);
+    assert.match(identity, /Recursive delegation is allowed/);
+    assert.ok(task.startsWith("<subagent_identity>"));
+    assert.ok(task.endsWith("Inspect the driver."));
+  });
+
+  it("rejects corrupt or inconsistent inherited lineage instead of silently resetting depth", () => {
+    const lineage = appendSubagentLineage(createRootLineage("root", "/root.jsonl"), {
+      id: "a",
+      name: "first",
+      sessionFile: "/first.jsonl",
+    });
+    assert.throws(
+      () => readSubagentLineageFromEnvironment({
+        PI_SUBAGENT_LINEAGE: serializeSubagentLineage(lineage),
+        PI_SUBAGENT_DEPTH: "4",
+      }),
+      /disagrees with lineage depth 1/,
+    );
+    assert.throws(
+      () => validateSubagentLineage({ ...lineage, chain: [{ ...lineage.chain[0], depth: 9 }] }),
+      /expected 1/,
+    );
+  });
+});
 
 describe("session.ts", () => {
   let dir: string;
@@ -451,6 +545,66 @@ describe("session.ts", () => {
   });
 
   describe("seedSubagentSessionFile", () => {
+    it("persists complete lineage for a context-standalone child", () => {
+      const parentFile = createSessionFile(dir, [SESSION_HEADER, USER_MSG]);
+      const childFile = join(dir, "standalone-child.jsonl");
+      const lineage = appendSubagentLineage(
+        createRootLineage("root-session", parentFile),
+        {
+          id: "child-id",
+          name: "standalone-child",
+          sessionFile: childFile,
+        },
+      );
+
+      seedSubagentSessionFile({
+        mode: "standalone",
+        parentSessionFile: parentFile,
+        childSessionFile: childFile,
+        childCwd: "/tmp/standalone-child",
+        lineage,
+      });
+
+      const lines = readFileSync(childFile, "utf8").trim().split("\n");
+      assert.equal(lines.length, 1);
+      const header = JSON.parse(lines[0]);
+      assert.equal(header.parentSession, undefined);
+      assert.equal(header.subagentDepth, 1);
+      assert.deepEqual(header.subagentLineage, lineage);
+      assert.deepEqual(readSubagentLineageFromSessionFile(childFile), lineage);
+    });
+
+    it("updates persisted lineage for a resumed session without changing its turns", () => {
+      const sessionFile = createSessionFile(dir, [SESSION_HEADER, USER_MSG, ASSISTANT_MSG]);
+      const before = readFileSync(sessionFile, "utf8").trim().split("\n").slice(1);
+      const lineage = appendSubagentLineage(createRootLineage("root", "/root.jsonl"), {
+        id: "resumed-child",
+        name: "resume",
+        sessionFile,
+      });
+
+      writeSubagentLineageToSessionFile(sessionFile, lineage);
+
+      const after = readFileSync(sessionFile, "utf8").trim().split("\n");
+      assert.deepEqual(after.slice(1), before);
+      assert.deepEqual(readSubagentLineageFromSessionFile(sessionFile), lineage);
+    });
+
+    it("rejects a persisted depth that disagrees with the persisted chain", () => {
+      const sessionFile = createSessionFile(dir, [{
+        ...SESSION_HEADER,
+        subagentDepth: 9,
+        subagentLineage: appendSubagentLineage(
+          createRootLineage("root", "/root.jsonl"),
+          { id: "child", name: "child", sessionFile: "/child.jsonl" },
+        ),
+      }]);
+      assert.throws(
+        () => readSubagentLineageFromSessionFile(sessionFile),
+        /disagrees with lineage depth 1/,
+      );
+    });
+
     it("creates a lineage-only child session with parent linkage and no copied turns", () => {
       const parentFile = createSessionFile(dir, [SESSION_HEADER, MODEL_CHANGE, USER_MSG, ASSISTANT_MSG]);
       const childFile = join(dir, "lineage-child.jsonl");
@@ -1182,7 +1336,7 @@ describe("subagent discovery", () => {
   it("resolves launch behavior for standalone, lineage-only, and fork modes", () => {
     assert.deepEqual(testApi.resolveLaunchBehavior({ name: "A", task: "T" }, null), {
       sessionMode: "standalone",
-      seededSessionMode: null,
+      seededSessionMode: "standalone",
       inheritsConversationContext: false,
       taskDelivery: "artifact",
     });

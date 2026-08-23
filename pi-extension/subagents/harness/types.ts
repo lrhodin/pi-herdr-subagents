@@ -1,5 +1,6 @@
 import type { ResolvedRuntimePlan, ThinkingLevel } from "../runtime-routing.ts";
 import type { CompletionResult } from "../completion.ts";
+import type { SubagentLineage } from "../lineage.ts";
 
 export interface SubagentLaunchParams {
   id: string;
@@ -54,6 +55,7 @@ export interface SubagentLaunchContext {
   roleBlock?: string;
   modeHint?: string;
   summaryInstruction?: string;
+  lineage: SubagentLineage;
   subagentsDir: string;
   shellQuote: (s: string) => string;
 }

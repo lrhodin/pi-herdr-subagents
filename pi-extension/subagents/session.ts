@@ -1,6 +1,16 @@
-import { appendFileSync, copyFileSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
+import {
+  appendFileSync,
+  copyFileSync,
+  mkdirSync,
+  readFileSync,
+  renameSync,
+  statSync,
+  writeFileSync,
+} from "node:fs";
 import { randomBytes, randomUUID } from "node:crypto";
 import { dirname, join } from "node:path";
+import type { SubagentLineage } from "./lineage.ts";
+import { validateSubagentLineage } from "./lineage.ts";
 
 export interface SessionEntry {
   type: string;
@@ -17,7 +27,7 @@ export interface MessageEntry extends SessionEntry {
   };
 }
 
-export type SeededSubagentSessionMode = "lineage-only" | "fork";
+export type SeededSubagentSessionMode = "standalone" | "lineage-only" | "fork";
 
 function getForkContentLines(parentSessionFile: string): string[] {
   const raw = readFileSync(parentSessionFile, "utf8");
@@ -45,19 +55,74 @@ function getForkContentLines(parentSessionFile: string): string[] {
   });
 }
 
+export function readSubagentLineageFromSessionFile(sessionFile: string): SubagentLineage | null {
+  const raw = readFileSync(sessionFile, "utf8");
+  const headerLine = raw.split("\n").find((line) => line.trim());
+  if (!headerLine) return null;
+  const header = JSON.parse(headerLine) as {
+    type?: unknown;
+    subagentLineage?: unknown;
+    subagentDepth?: unknown;
+  };
+  if (header.type !== "session" || header.subagentLineage == null) return null;
+  const lineage = validateSubagentLineage(header.subagentLineage);
+  if (
+    header.subagentDepth != null &&
+    header.subagentDepth !== lineage.chain.length
+  ) {
+    throw new Error(
+      `session subagentDepth=${String(header.subagentDepth)} disagrees with lineage depth ${lineage.chain.length}`,
+    );
+  }
+  return lineage;
+}
+
+export function writeSubagentLineageToSessionFile(
+  sessionFile: string,
+  lineageValue: SubagentLineage,
+): void {
+  const lineage = validateSubagentLineage(lineageValue);
+  const raw = readFileSync(sessionFile, "utf8");
+  const lines = raw.split("\n");
+  const headerIndex = lines.findIndex((line) => line.trim());
+  if (headerIndex < 0) throw new Error(`session file is empty: ${sessionFile}`);
+  const header = JSON.parse(lines[headerIndex]) as Record<string, unknown>;
+  if (header.type !== "session") {
+    throw new Error(`session file does not start with a session header: ${sessionFile}`);
+  }
+  lines[headerIndex] = JSON.stringify({
+    ...header,
+    subagentLineage: lineage,
+    subagentDepth: lineage.chain.length,
+  });
+  const output = lines.join("\n");
+  const temporary = `${sessionFile}.lineage-${randomBytes(6).toString("hex")}.tmp`;
+  const mode = statSync(sessionFile).mode & 0o777;
+  writeFileSync(temporary, output, { encoding: "utf8", mode });
+  renameSync(temporary, sessionFile);
+}
+
 export function seedSubagentSessionFile(params: {
   mode: SeededSubagentSessionMode;
   parentSessionFile: string;
   childSessionFile: string;
   childCwd: string;
+  lineage?: SubagentLineage;
 }): void {
+  const lineage = params.lineage ? validateSubagentLineage(params.lineage) : undefined;
   const header = {
     type: "session",
     version: 3,
     id: randomUUID(),
     timestamp: new Date().toISOString(),
     cwd: params.childCwd,
-    parentSession: params.parentSessionFile,
+    ...(params.mode === "standalone" ? {} : { parentSession: params.parentSessionFile }),
+    ...(lineage
+      ? {
+          subagentLineage: lineage,
+          subagentDepth: lineage.chain.length,
+        }
+      : {}),
   };
   const contentLines =
     params.mode === "fork" ? getForkContentLines(params.parentSessionFile) : [];
