@@ -71,6 +71,7 @@ import subagentDoneExtension, {
   shouldMarkUserTookOver,
   shouldAutoExitOnAgentEnd,
   findLatestAssistantError,
+  isUserAbortMessage,
   buildCompletionSidecar,
 } from "../pi-extension/subagents/subagent-done.ts";
 import { interpretExitSidecar, waitForCompletion } from "../pi-extension/subagents/completion.ts";
@@ -1746,6 +1747,14 @@ describe("subagent-done.ts", () => {
       const messages = [{ role: "assistant", stopReason: "error", errorMessage: "529 overloaded" }];
       assert.equal(shouldAutoExitOnAgentEnd(false, messages), true);
     });
+
+    it("stays open when an Escape abort arrives mislabelled as stopReason=error", () => {
+      // Escape mid-tool-call aborts the next call during stream setup, where
+      // upstream lazyStream hardcodes stopReason "error". The human is steering
+      // this pane; exiting underneath them is the bug.
+      const messages = [{ role: "assistant", stopReason: "error", errorMessage: "This operation was aborted" }];
+      assert.equal(shouldAutoExitOnAgentEnd(false, messages), false);
+    });
   });
 
   describe("auto-exit lifecycle", () => {
@@ -1869,6 +1878,46 @@ describe("subagent-done.ts", () => {
     it("returns null when messages is undefined or empty", () => {
       assert.equal(findLatestAssistantError(undefined), null);
       assert.equal(findLatestAssistantError([]), null);
+    });
+
+    it("returns null for an abort mislabelled as stopReason=error", () => {
+      // Regression: this produced "provider/agent error — auto-retry exhausted"
+      // for a retry that never ran, about a child still alive and taking input.
+      const messages = [{ role: "assistant", stopReason: "error", errorMessage: "This operation was aborted" }];
+      assert.equal(findLatestAssistantError(messages), null);
+    });
+
+    it("still reports genuine retry exhaustion that merely mentions aborting", () => {
+      // The guard must not widen into a substring match: this IS a real failure
+      // and the parent must be woken.
+      const messages = [{ role: "assistant", stopReason: "error", errorMessage: "Aborted after 1 retry attempt" }];
+      assert.deepEqual(findLatestAssistantError(messages), {
+        errorMessage: "Aborted after 1 retry attempt",
+        stopReason: "error",
+      });
+    });
+  });
+
+  describe("isUserAbortMessage", () => {
+    it("matches the bare Node AbortError reason, with optional prefix and punctuation", () => {
+      assert.equal(isUserAbortMessage("This operation was aborted"), true);
+      assert.equal(isUserAbortMessage("this operation was aborted"), true);
+      assert.equal(isUserAbortMessage("  This operation was aborted  "), true);
+      assert.equal(isUserAbortMessage("This operation was aborted."), true);
+      assert.equal(isUserAbortMessage("Error: This operation was aborted"), true);
+    });
+
+    it("rejects real provider failures and anything merely containing the phrase", () => {
+      // Every one of these must reach the parent as a failure.
+      assert.equal(isUserAbortMessage("Aborted after 1 retry attempt"), false);
+      assert.equal(isUserAbortMessage("529 overloaded_error"), false);
+      assert.equal(isUserAbortMessage("503 no healthy upstream"), false);
+      assert.equal(isUserAbortMessage("Request timed out."), false);
+      assert.equal(isUserAbortMessage("402 {\"error\":\"insufficient credit\"}"), false);
+      assert.equal(isUserAbortMessage("upstream said: This operation was aborted by the server"), false);
+      assert.equal(isUserAbortMessage(undefined), false);
+      assert.equal(isUserAbortMessage(null), false);
+      assert.equal(isUserAbortMessage(""), false);
     });
   });
 

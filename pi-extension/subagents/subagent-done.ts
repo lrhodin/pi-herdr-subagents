@@ -26,11 +26,17 @@ export function shouldAutoExitOnAgentEnd(
   // returns true — we want to shut down so the parent is woken up — but we
   // pair this with findLatestAssistantError() so the parent learns it was an
   // error, not a clean completion.
+  //
+  // An abort that arrives as stopReason: "error" (see isUserAbortMessage) is
+  // treated exactly like stopReason: "aborted": the human is steering this
+  // pane, so stay open for their next prompt instead of exiting underneath them.
   if (messages) {
     for (let i = messages.length - 1; i >= 0; i--) {
       const msg = messages[i];
       if (msg?.role === "assistant") {
-        return msg.stopReason !== "aborted";
+        if (msg.stopReason === "aborted") return false;
+        if (msg.stopReason === "error" && isUserAbortMessage(msg.errorMessage)) return false;
+        return true;
       }
     }
   }
@@ -44,13 +50,37 @@ export interface SubagentErrorInfo {
 }
 
 /**
+ * Recognize a user abort that reached us mislabelled as `stopReason: "error"`.
+ *
+ * When a human presses Escape mid-tool-call, the next provider call aborts
+ * during stream setup. Upstream `lazyStream` has no abort branch there and
+ * hardcodes `stopReason: "error"`, so the abort identity is destroyed before it
+ * reaches this extension; the only surviving evidence is the message text,
+ * which is Node's own `AbortError` reason rather than any provider string.
+ *
+ * Real provider failures always carry a status code or JSON envelope
+ * (`402 {...}`, `503 no healthy upstream`, `529 overloaded_error`,
+ * `Request timed out.`), so matching the bare abort text does not swallow them.
+ *
+ * Deliberately strict: anchored, and tolerant only of the optional `Error:`
+ * prefix and surrounding whitespace. `Aborted after 1 retry attempt` is genuine
+ * retry exhaustion and must NOT match.
+ */
+export function isUserAbortMessage(errorMessage: unknown): boolean {
+  if (typeof errorMessage !== "string") return false;
+  return /^(?:error:\s*)?this operation was aborted\.?$/i.test(errorMessage.trim());
+}
+
+/**
  * If the last assistant message in the turn ended with `stopReason: "error"`
  * (typically auto-retry exhausted on an overload / rate limit / server error),
  * return its error info so the parent orchestrator can surface a clear
  * failure instead of silently treating the run as completed.
  *
- * Returns `null` when the latest assistant turn completed normally or was
- * aborted by the user (handled separately by shouldAutoExitOnAgentEnd).
+ * Returns `null` when the latest assistant turn completed normally, or was
+ * aborted by the user — whether that abort is honestly labelled
+ * `stopReason: "aborted"` or arrived mislabelled as `"error"` (see
+ * isUserAbortMessage).
  */
 export function findLatestAssistantError(
   messages: any[] | undefined,
@@ -60,6 +90,10 @@ export function findLatestAssistantError(
     const msg = messages[i];
     if (msg?.role !== "assistant") continue;
     if (msg.stopReason !== "error") return null;
+    // A mislabelled user abort is not a failure. Reporting one made the parent
+    // tell the human "auto-retry exhausted" for a retry that never ran, about a
+    // child that was alive and taking their input.
+    if (isUserAbortMessage(msg.errorMessage)) return null;
     const raw = typeof msg.errorMessage === "string" ? msg.errorMessage.trim() : "";
     return {
       errorMessage: raw || "Subagent agent loop ended with stopReason=error (no errorMessage field).",
