@@ -7,24 +7,12 @@ import type {
 } from "../types.ts";
 import type { ResolvedRuntimePlan } from "../../runtime-routing.ts";
 import { serializeSubagentLineage } from "../../lineage.ts";
+import {
+  buildSubagentToolAllowlist,
+  formatSpawningPolicyGuidance,
+} from "../../policy.ts";
 
-const SUBAGENT_CONTROL_TOOLS = ["caller_ping", "subagent_done"] as const;
-
-export function buildSubagentToolAllowlist(effectiveTools?: string): string | null {
-  const requested = (effectiveTools ?? "")
-    .split(",")
-    .map((tool) => tool.trim())
-    .filter(Boolean);
-
-  if (requested.length === 0) return null;
-
-  const allow = new Set(requested);
-  for (const tool of SUBAGENT_CONTROL_TOOLS) {
-    allow.add(tool);
-  }
-
-  return [...allow].join(",");
-}
+export { buildSubagentToolAllowlist };
 
 export function buildPiPromptArgs(params: {
   effectiveSkills?: string;
@@ -71,6 +59,7 @@ export class PiHarnessDriver implements HarnessDriver {
       effectiveAutoExit,
       taskDelivery,
       denySet,
+      policy,
       identity,
       identityInSystemPrompt,
       systemPromptMode,
@@ -110,11 +99,18 @@ export class PiHarnessDriver implements HarnessDriver {
       parts.push(flag, shellQuote(syspromptPath));
     }
 
-    const effectiveTools = params.tools ?? agentDefs?.tools;
-    const toolAllowlist = buildSubagentToolAllowlist(effectiveTools);
-    if (toolAllowlist) {
-      parts.push("--tools", shellQuote(toolAllowlist));
+    // A disabled capability is security-relevant system guidance, not merely
+    // task prose. Keep it authoritative even if the delegated task asks the
+    // child to recurse despite its policy.
+    if (!policy.spawning) {
+      const policyPath = join(artifactDir, `context/subagent-policy-${params.id}.md`);
+      mkdirSync(dirname(policyPath), { recursive: true });
+      writeFileSync(policyPath, formatSpawningPolicyGuidance(false).join("\n"), "utf8");
+      parts.push("--append-system-prompt", shellQuote(policyPath));
     }
+
+    const toolAllowlist = policy.toolAllowlist?.join(",") ?? null;
+    if (toolAllowlist) parts.push("--tools", shellQuote(toolAllowlist));
 
     const envParts: string[] = [];
     if (localAgentDir && existsSync(localAgentDir)) {
@@ -126,6 +122,7 @@ export class PiHarnessDriver implements HarnessDriver {
     if (denySet && denySet.size > 0) {
       envParts.push(`PI_DENY_TOOLS=${shellQuote([...denySet].join(","))}`);
     }
+    envParts.push(`PI_SUBAGENT_SPAWNING=${policy.spawning ? "1" : "0"}`);
     envParts.push(`PI_SUBAGENT_NAME=${shellQuote(params.name)}`);
     if (params.agent) {
       envParts.push(`PI_SUBAGENT_AGENT=${shellQuote(params.agent)}`);

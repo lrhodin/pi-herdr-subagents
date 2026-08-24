@@ -1,6 +1,6 @@
 /**
  * Extension loaded into sub-agents.
- * - Shows agent identity + available tools as a styled widget above the editor (toggle with Ctrl+J)
+ * - Shows agent identity + active tools as a styled widget above the editor (toggle with Alt+J)
  * - Provides a `subagent_done` tool for autonomous agents to self-terminate
  */
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
@@ -8,6 +8,7 @@ import { Box, Text } from "@earendil-works/pi-tui";
 import { Type } from "@sinclair/typebox";
 import { writeFileSync } from "node:fs";
 import { createSubagentActivityRecorder } from "./activity.ts";
+import { getWidgetDeniedTools, readSpawningFromEnvironment } from "./policy.ts";
 
 export function shouldMarkUserTookOver(agentStarted: boolean): boolean {
   return agentStarted;
@@ -75,6 +76,11 @@ export function buildCompletionSidecar(messages: any[] | undefined):
   return errorInfo ? { type: "error", ...errorInfo } : { type: "done" };
 }
 
+export function hasRunningDescendants(): boolean {
+  const runtime = (globalThis as any)[Symbol.for("pi-subagents/runtime")];
+  return runtime?.runningSubagents instanceof Map && runtime.runningSubagents.size > 0;
+}
+
 export function parseDeniedTools(rawValue: string | undefined): string[] {
   return (rawValue ?? "")
     .split(",")
@@ -91,6 +97,7 @@ export default function (pi: ExtensionAPI) {
   const subagentName = process.env.PI_SUBAGENT_NAME ?? "";
   const subagentAgent = process.env.PI_SUBAGENT_AGENT ?? "";
   const deniedToolsValue = process.env.PI_DENY_TOOLS;
+  const spawningAllowed = readSpawningFromEnvironment();
   const autoExit = process.env.PI_SUBAGENT_AUTO_EXIT === "1";
   const recorder = createSubagentActivityRecorder({
     runningChildId: process.env.PI_SUBAGENT_ID,
@@ -109,7 +116,10 @@ export default function (pi: ExtensionAPI) {
         if (expanded) {
           // Expanded: full tool list + denied
           const countInfo = theme.fg("dim", ` — ${toolNames.length} available`);
-          const hint = theme.fg("muted", "  (Ctrl+J to collapse)");
+          const spawningInfo = spawningAllowed
+            ? ""
+            : theme.fg("muted", " · recursive spawning disabled");
+          const hint = theme.fg("muted", "  (Alt+J to collapse)");
 
           const toolList = toolNames
             .map((name: string) => theme.fg("dim", name))
@@ -124,7 +134,7 @@ export default function (pi: ExtensionAPI) {
           }
 
           const content = new Text(
-            `${agentTag}${countInfo}${hint}\n${toolList}${deniedLine}`,
+            `${agentTag}${countInfo}${spawningInfo}${hint}\n${toolList}${deniedLine}`,
             0,
             0,
           );
@@ -132,13 +142,20 @@ export default function (pi: ExtensionAPI) {
         } else {
           // Collapsed: one-line summary
           const countInfo = theme.fg("dim", ` — ${toolNames.length} tools`);
+          const spawningInfo = spawningAllowed
+            ? ""
+            : theme.fg("muted", " · recursive spawning disabled");
           const deniedInfo =
             denied.length > 0
               ? theme.fg("dim", " · ") + theme.fg("error", `${denied.length} denied`)
               : "";
-          const hint = theme.fg("muted", "  (Ctrl+J to expand)");
+          const hint = theme.fg("muted", "  (Alt+J to expand)");
 
-          const content = new Text(`${agentTag}${countInfo}${deniedInfo}${hint}`, 0, 0);
+          const content = new Text(
+            `${agentTag}${countInfo}${spawningInfo}${deniedInfo}${hint}`,
+            0,
+            0,
+          );
           box.addChild(content);
         }
 
@@ -155,9 +172,8 @@ export default function (pi: ExtensionAPI) {
   // Show widget + status bar on session start
   pi.on("session_start", (_event, ctx) => {
     recorder.sessionStart();
-    const tools = pi.getAllTools();
-    toolNames = tools.map((t) => t.name).sort();
-    denied = parseDeniedTools(deniedToolsValue);
+    toolNames = pi.getActiveTools().sort();
+    denied = getWidgetDeniedTools(parseDeniedTools(deniedToolsValue), spawningAllowed);
 
     renderWidget(ctx, null);
   });
@@ -190,6 +206,13 @@ export default function (pi: ExtensionAPI) {
   pi.on("agent_settled", (_event, ctx) => {
     const shouldExit = autoExit
       && shouldAutoExitOnAgentEnd(userTookOver, latestAgentMessages);
+
+    if (shouldExit && hasRunningDescendants()) {
+      // A recursive child result is delivered as a new turn. Keep this process
+      // alive until every descendant watcher has delivered, then the resulting
+      // settled turn can auto-exit normally.
+      return;
+    }
 
     if (shouldExit) {
       // Surface stopReason: "error" turns (auto-retry exhausted, provider
@@ -264,8 +287,8 @@ export default function (pi: ExtensionAPI) {
     recorder.sessionShutdown((event as any).reason);
   });
 
-  // Toggle expand/collapse with Ctrl+J
-  pi.registerShortcut("ctrl+j", {
+  // Toggle expand/collapse without conflicting with Pi's built-in Ctrl+J newline.
+  pi.registerShortcut("alt+j", {
     description: "Toggle subagent tools widget",
     handler: (ctx) => {
       expanded = !expanded;

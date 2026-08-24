@@ -1,6 +1,7 @@
 import type { ResolvedRuntimePlan, ThinkingLevel } from "../runtime-routing.ts";
 import type { CompletionResult } from "../completion.ts";
 import type { SubagentLineage } from "../lineage.ts";
+import type { EffectiveSubagentPolicy } from "../policy.ts";
 
 export interface SubagentLaunchParams {
   id: string;
@@ -49,6 +50,7 @@ export interface SubagentLaunchContext {
   inheritsConversationContext: boolean;
   taskDelivery: "direct" | "artifact";
   denySet?: Set<string>;
+  policy: EffectiveSubagentPolicy;
   identity?: string | null;
   identityInSystemPrompt?: boolean;
   systemPromptMode?: string;

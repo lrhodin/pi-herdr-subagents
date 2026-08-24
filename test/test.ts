@@ -22,6 +22,7 @@ import {
   copySessionFile,
   mergeNewEntries,
   readSubagentLineageFromSessionFile,
+  readSubagentPolicyFromSessionFile,
   seedSubagentSessionFile,
   writeSubagentLineageToSessionFile,
 } from "../pi-extension/subagents/session.ts";
@@ -37,6 +38,12 @@ import {
   serializeSubagentLineage,
   validateSubagentLineage,
 } from "../pi-extension/subagents/lineage.ts";
+import {
+  createEffectiveSubagentPolicy,
+  getWidgetDeniedTools,
+  parseSpawningBoolean,
+  validateEffectiveSubagentPolicy,
+} from "../pi-extension/subagents/policy.ts";
 import {
   loadModelConfig,
   parseModelConfig,
@@ -85,11 +92,13 @@ const inheritedSubagentId = process.env.PI_SUBAGENT_ID;
 const inheritedDenyTools = process.env.PI_DENY_TOOLS;
 const inheritedSubagentDepth = process.env.PI_SUBAGENT_DEPTH;
 const inheritedSubagentLineage = process.env.PI_SUBAGENT_LINEAGE;
+const inheritedSubagentSpawning = process.env.PI_SUBAGENT_SPAWNING;
 before(() => {
   delete process.env.PI_SUBAGENT_ID;
   delete process.env.PI_DENY_TOOLS;
   delete process.env.PI_SUBAGENT_DEPTH;
   delete process.env.PI_SUBAGENT_LINEAGE;
+  delete process.env.PI_SUBAGENT_SPAWNING;
 });
 after(() => {
   if (inheritedSubagentId == null) delete process.env.PI_SUBAGENT_ID;
@@ -100,6 +109,8 @@ after(() => {
   else process.env.PI_SUBAGENT_DEPTH = inheritedSubagentDepth;
   if (inheritedSubagentLineage == null) delete process.env.PI_SUBAGENT_LINEAGE;
   else process.env.PI_SUBAGENT_LINEAGE = inheritedSubagentLineage;
+  if (inheritedSubagentSpawning == null) delete process.env.PI_SUBAGENT_SPAWNING;
+  else process.env.PI_SUBAGENT_SPAWNING = inheritedSubagentSpawning;
 });
 
 // --- Helpers ---
@@ -160,7 +171,7 @@ function createMockExtensionApi() {
       sendMessage(message: any, options?: any) {
         sentMessages.push({ message, options });
       },
-      getAllTools() {
+      getActiveTools() {
         return [];
       },
     } as any,
@@ -324,6 +335,19 @@ describe("lineage.ts", () => {
     assert.ok(task.endsWith("Inspect the driver."));
   });
 
+  it("describes disabled spawning without claiming recursive delegation is allowed", () => {
+    const lineage = appendSubagentLineage(createRootLineage("root", "/root.jsonl"), {
+      id: "a",
+      name: "restricted",
+      sessionFile: "/restricted.jsonl",
+    });
+    const identity = formatSubagentIdentity(lineage, { spawningAllowed: false });
+
+    assert.match(identity, /Recursive spawning is disabled/);
+    assert.match(identity, /management tools are unavailable/);
+    assert.doesNotMatch(identity, /Recursive delegation is allowed/);
+  });
+
   it("rejects corrupt or inconsistent inherited lineage instead of silently resetting depth", () => {
     const lineage = appendSubagentLineage(createRootLineage("root", "/root.jsonl"), {
       id: "a",
@@ -340,6 +364,35 @@ describe("lineage.ts", () => {
     assert.throws(
       () => validateSubagentLineage({ ...lineage, chain: [{ ...lineage.chain[0], depth: 9 }] }),
       /expected 1/,
+    );
+  });
+});
+
+describe("subagent policy", () => {
+  it("keeps semantic spawning denial separate from fine-grained denies", () => {
+    const disabled = createEffectiveSubagentPolicy({
+      spawning: false,
+      denyTools: "claude",
+      effectiveTools: "read,bash",
+      agent: "restricted",
+    });
+
+    assert.equal(disabled.spawning, false);
+    assert.ok(disabled.deniedTools.includes("subagent"));
+    assert.deepEqual(getWidgetDeniedTools(disabled.deniedTools, false), ["claude"]);
+    assert.ok(disabled.toolAllowlist?.includes("read"));
+    assert.equal(disabled.toolAllowlist?.includes("subagent"), false);
+  });
+
+  it("validates disabled policies cannot accidentally allow management tools", () => {
+    const disabled = createEffectiveSubagentPolicy({ spawning: false });
+    assert.deepEqual(validateEffectiveSubagentPolicy(disabled), disabled);
+    assert.throws(
+      () => validateEffectiveSubagentPolicy({
+        ...disabled,
+        toolAllowlist: ["read", "subagent"],
+      }),
+      /cannot allow subagent/,
     );
   });
 });
@@ -557,12 +610,18 @@ describe("session.ts", () => {
         },
       );
 
+      const policy = createEffectiveSubagentPolicy({
+        spawning: false,
+        effectiveTools: "read,bash",
+        agent: "restricted",
+      });
       seedSubagentSessionFile({
         mode: "standalone",
         parentSessionFile: parentFile,
         childSessionFile: childFile,
         childCwd: "/tmp/standalone-child",
         lineage,
+        policy,
       });
 
       const lines = readFileSync(childFile, "utf8").trim().split("\n");
@@ -571,23 +630,39 @@ describe("session.ts", () => {
       assert.equal(header.parentSession, undefined);
       assert.equal(header.subagentDepth, 1);
       assert.deepEqual(header.subagentLineage, lineage);
+      assert.deepEqual(header.subagentPolicy, policy);
       assert.deepEqual(readSubagentLineageFromSessionFile(childFile), lineage);
+      assert.deepEqual(readSubagentPolicyFromSessionFile(childFile), policy);
     });
 
-    it("updates persisted lineage for a resumed session without changing its turns", () => {
+    it("treats a not-yet-created Pi session file as having no persisted metadata", () => {
+      const deferredSessionFile = join(dir, "deferred-session.jsonl");
+
+      assert.equal(readSubagentLineageFromSessionFile(deferredSessionFile), null);
+      assert.equal(readSubagentPolicyFromSessionFile(deferredSessionFile), null);
+    });
+
+    it("updates persisted lineage and policy for resume without changing turns", () => {
       const sessionFile = createSessionFile(dir, [SESSION_HEADER, USER_MSG, ASSISTANT_MSG]);
       const before = readFileSync(sessionFile, "utf8").trim().split("\n").slice(1);
       const lineage = appendSubagentLineage(createRootLineage("root", "/root.jsonl"), {
         id: "resumed-child",
         name: "resume",
         sessionFile,
+        agent: "restricted",
+      });
+      const policy = createEffectiveSubagentPolicy({
+        spawning: false,
+        effectiveTools: "read,bash",
+        agent: "restricted",
       });
 
-      writeSubagentLineageToSessionFile(sessionFile, lineage);
+      writeSubagentLineageToSessionFile(sessionFile, lineage, policy);
 
       const after = readFileSync(sessionFile, "utf8").trim().split("\n");
       assert.deepEqual(after.slice(1), before);
       assert.deepEqual(readSubagentLineageFromSessionFile(sessionFile), lineage);
+      assert.deepEqual(readSubagentPolicyFromSessionFile(sessionFile), policy);
     });
 
     it("rejects a persisted depth that disagrees with the persisted chain", () => {
@@ -1296,6 +1371,7 @@ describe("subagent discovery", () => {
           interactive,
           `${name} should preserve its interaction mode`,
         );
+        assert.equal(defs.spawning, undefined, `${name} should allow recursive spawning by default`);
       }
     });
   });
@@ -1372,10 +1448,30 @@ describe("subagent discovery", () => {
     );
   });
 
-  it("buildSubagentToolAllowlist preserves requested tools and adds child control tools", () => {
+  it("buildSubagentToolAllowlist adds control and management tools to native allowlists", () => {
     assert.equal(
       testApi.buildSubagentToolAllowlist("read,bash,web_search"),
-      "read,bash,web_search,caller_ping,subagent_done",
+      "read,bash,web_search,caller_ping,subagent_done,subagent,subagent_interrupt,subagents_list,subagent_resume",
+    );
+  });
+
+  it("buildSubagentToolAllowlist honors fine-grained management denies", () => {
+    assert.equal(
+      testApi.buildSubagentToolAllowlist(
+        "read,bash",
+        new Set(["subagent_resume"]),
+      ),
+      "read,bash,caller_ping,subagent_done,subagent,subagent_interrupt,subagents_list",
+    );
+  });
+
+  it("strictly rejects invalid spawning frontmatter", () => {
+    assert.equal(parseSpawningBoolean("true"), true);
+    assert.equal(parseSpawningBoolean("false"), false);
+    assert.throws(() => parseSpawningBoolean("False"), /must be true or false/);
+    assert.throws(
+      () => testApi.parseAgentDefinition("---\nname: broken\nspawning: no\n---\n", "broken"),
+      /spawning must be true or false/,
     );
   });
 
@@ -1703,6 +1799,33 @@ describe("subagent-done.ts", () => {
         eventHandlers.get("agent_settled")![0]({ type: "agent_settled" }, ctx);
         assert.equal(shutdowns, 0);
       } finally {
+        restoreEnvVar("PI_SUBAGENT_AUTO_EXIT", previousAutoExit);
+      }
+    });
+
+    it("defers auto-exit until recursive descendants have delivered", () => {
+      const previousAutoExit = process.env.PI_SUBAGENT_AUTO_EXIT;
+      process.env.PI_SUBAGENT_AUTO_EXIT = "1";
+      const runtime = (globalThis as any)[Symbol.for("pi-subagents/runtime")];
+      assert.ok(runtime?.runningSubagents instanceof Map);
+      runtime.runningSubagents.set("test-descendant", {});
+      try {
+        const { api, eventHandlers } = createMockExtensionApi();
+        subagentDoneExtension(api);
+        let shutdowns = 0;
+        const ctx = { shutdown: () => { shutdowns += 1; } };
+        const normalEnd = { messages: [{ role: "assistant", stopReason: "stop" }] };
+
+        eventHandlers.get("agent_end")![0](normalEnd, ctx);
+        eventHandlers.get("agent_settled")![0]({ type: "agent_settled" }, ctx);
+        assert.equal(shutdowns, 0, "active descendant watcher must keep the parent child alive");
+
+        runtime.runningSubagents.delete("test-descendant");
+        eventHandlers.get("agent_end")![0](normalEnd, ctx);
+        eventHandlers.get("agent_settled")![0]({ type: "agent_settled" }, ctx);
+        assert.equal(shutdowns, 1, "the post-delivery turn may auto-exit normally");
+      } finally {
+        runtime.runningSubagents.delete("test-descendant");
         restoreEnvVar("PI_SUBAGENT_AUTO_EXIT", previousAutoExit);
       }
     });
@@ -2190,6 +2313,29 @@ describe("commands", () => {
 });
 
 describe("tool registration", () => {
+  it("does not fail session_start before Pi creates a new persistent session file", () => {
+    withTempDir((dir) => {
+      const deferredSessionFile = join(dir, "deferred-session.jsonl");
+      const { api, eventHandlers } = createMockExtensionApi();
+      (subagentsModule as any).default(api);
+
+      const sessionStart = eventHandlers.get("session_start")?.[0];
+      assert.ok(sessionStart);
+      assert.doesNotThrow(() => sessionStart({}, {
+        hasUI: false,
+        sessionManager: {
+          getSessionFile: () => deferredSessionFile,
+          getSessionId: () => "deferred-session-id",
+        },
+        modelRegistry: {
+          find: () => undefined,
+          getAvailable: () => [],
+          hasConfiguredAuth: () => false,
+        },
+      }));
+    });
+  });
+
   it("advertises named agents and tells callers to preserve their runtime defaults", async () => {
     await withIsolatedAgentEnv(async ({ globalAgentsDir }) => {
       writeAgentFile(
@@ -2298,6 +2444,23 @@ describe("tool registration", () => {
     }
   });
 
+  it("unregisters every management tool when semantic spawning is disabled", () => {
+    process.env.PI_SUBAGENT_ID = "restricted-child";
+    process.env.PI_SUBAGENT_SPAWNING = "0";
+    process.env.PI_DENY_TOOLS = "subagent,subagent_interrupt,subagents_list,subagent_resume";
+    try {
+      const { api, registeredTools } = createMockExtensionApi();
+      (subagentsModule as any).default(api);
+      for (const name of ["subagent", "subagent_interrupt", "subagents_list", "subagent_resume"]) {
+        assert.equal(registeredTools.some((tool) => tool.name === name), false, name);
+      }
+    } finally {
+      delete process.env.PI_SUBAGENT_ID;
+      delete process.env.PI_SUBAGENT_SPAWNING;
+      delete process.env.PI_DENY_TOOLS;
+    }
+  });
+
   it("defaults resumed subagents to auto-exit and non-interactive tracking", () => {
     const testApi = (subagentsModule as any).__test__;
 
@@ -2351,6 +2514,44 @@ describe("tool registration", () => {
     const autoExitSchema = resumeTool.parameters.properties.autoExit;
     assert.equal(autoExitSchema.type, "boolean");
     assert.match(autoExitSchema.description, /Defaults to true/);
+  });
+
+  it("refuses to resume legacy sessions without persisted tool policy", async () => {
+    const dir = createTestDir();
+    const previousHerdrEnv = process.env.HERDR_ENV;
+    try {
+      process.env.HERDR_ENV = "1";
+      const parentSession = createSessionFile(dir, [SESSION_HEADER]);
+      const legacySession = join(dir, "legacy.jsonl");
+      writeFileSync(
+        legacySession,
+        JSON.stringify({ ...SESSION_HEADER, id: "legacy-session" }) + "\n",
+      );
+
+      const { api, registeredTools } = createMockExtensionApi();
+      (subagentsModule as any).default(api);
+      const resumeTool = registeredTools.find((tool) => tool.name === "subagent_resume");
+      assert.ok(resumeTool, "expected subagent_resume tool to be registered");
+
+      const result = await resumeTool.execute(
+        "resume-call",
+        { sessionPath: legacySession },
+        undefined,
+        undefined,
+        {
+          sessionManager: {
+            getSessionFile: () => parentSession,
+            getSessionId: () => "parent-session",
+          },
+        },
+      );
+
+      assert.equal(result.details?.error, "missing persisted subagent policy");
+      assert.match(result.content[0].text, /cannot be resumed safely/);
+    } finally {
+      restoreEnvVar("HERDR_ENV", previousHerdrEnv);
+      rmSync(dir, { recursive: true, force: true });
+    }
   });
 });
 

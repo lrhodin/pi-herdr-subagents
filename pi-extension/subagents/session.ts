@@ -11,6 +11,8 @@ import { randomBytes, randomUUID } from "node:crypto";
 import { dirname, join } from "node:path";
 import type { SubagentLineage } from "./lineage.ts";
 import { validateSubagentLineage } from "./lineage.ts";
+import type { EffectiveSubagentPolicy } from "./policy.ts";
+import { validateEffectiveSubagentPolicy } from "./policy.ts";
 
 export interface SessionEntry {
   type: string;
@@ -55,15 +57,27 @@ function getForkContentLines(parentSessionFile: string): string[] {
   });
 }
 
+function readSessionHeader(sessionFile: string): Record<string, unknown> | null {
+  try {
+    const raw = readFileSync(sessionFile, "utf8");
+    const headerLine = raw.split("\n").find((line) => line.trim());
+    return headerLine ? JSON.parse(headerLine) as Record<string, unknown> : null;
+  } catch (error) {
+    // Pi assigns a path to a new persistent session before creating its JSONL
+    // file. `session_start` can therefore observe a valid, not-yet-existing
+    // path; it has no persisted extension metadata yet.
+    if ((error as NodeJS.ErrnoException).code === "ENOENT") return null;
+    throw error;
+  }
+}
+
 export function readSubagentLineageFromSessionFile(sessionFile: string): SubagentLineage | null {
-  const raw = readFileSync(sessionFile, "utf8");
-  const headerLine = raw.split("\n").find((line) => line.trim());
-  if (!headerLine) return null;
-  const header = JSON.parse(headerLine) as {
+  const header = readSessionHeader(sessionFile) as {
     type?: unknown;
     subagentLineage?: unknown;
     subagentDepth?: unknown;
-  };
+  } | null;
+  if (!header) return null;
   if (header.type !== "session" || header.subagentLineage == null) return null;
   const lineage = validateSubagentLineage(header.subagentLineage);
   if (
@@ -77,9 +91,18 @@ export function readSubagentLineageFromSessionFile(sessionFile: string): Subagen
   return lineage;
 }
 
+export function readSubagentPolicyFromSessionFile(
+  sessionFile: string,
+): EffectiveSubagentPolicy | null {
+  const header = readSessionHeader(sessionFile);
+  if (!header || header.type !== "session" || header.subagentPolicy == null) return null;
+  return validateEffectiveSubagentPolicy(header.subagentPolicy);
+}
+
 export function writeSubagentLineageToSessionFile(
   sessionFile: string,
   lineageValue: SubagentLineage,
+  policyValue?: EffectiveSubagentPolicy,
 ): void {
   const lineage = validateSubagentLineage(lineageValue);
   const raw = readFileSync(sessionFile, "utf8");
@@ -94,6 +117,9 @@ export function writeSubagentLineageToSessionFile(
     ...header,
     subagentLineage: lineage,
     subagentDepth: lineage.chain.length,
+    ...(policyValue
+      ? { subagentPolicy: validateEffectiveSubagentPolicy(policyValue) }
+      : {}),
   });
   const output = lines.join("\n");
   const temporary = `${sessionFile}.lineage-${randomBytes(6).toString("hex")}.tmp`;
@@ -108,8 +134,10 @@ export function seedSubagentSessionFile(params: {
   childSessionFile: string;
   childCwd: string;
   lineage?: SubagentLineage;
+  policy?: EffectiveSubagentPolicy;
 }): void {
   const lineage = params.lineage ? validateSubagentLineage(params.lineage) : undefined;
+  const policy = params.policy ? validateEffectiveSubagentPolicy(params.policy) : undefined;
   const header = {
     type: "session",
     version: 3,
@@ -123,6 +151,7 @@ export function seedSubagentSessionFile(params: {
           subagentDepth: lineage.chain.length,
         }
       : {}),
+    ...(policy ? { subagentPolicy: policy } : {}),
   };
   const contentLines =
     params.mode === "fork" ? getForkContentLines(params.parentSessionFile) : [];

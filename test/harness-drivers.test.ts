@@ -17,6 +17,7 @@ import {
 import type { ResolvedRuntimePlan } from "../pi-extension/subagents/runtime-routing.ts";
 import type { SubagentResultContext } from "../pi-extension/subagents/harness/types.ts";
 import { appendSubagentLineage, createRootLineage } from "../pi-extension/subagents/lineage.ts";
+import { createEffectiveSubagentPolicy } from "../pi-extension/subagents/policy.ts";
 
 function createMockLaunchContext(overrides?: Partial<SubagentLaunchContext>): SubagentLaunchContext {
   const runtimePlan: ResolvedRuntimePlan = {
@@ -47,6 +48,7 @@ function createMockLaunchContext(overrides?: Partial<SubagentLaunchContext>): Su
     effectiveInteractive: false,
     inheritsConversationContext: true,
     taskDelivery: "direct",
+    policy: createEffectiveSubagentPolicy({}),
     lineage: appendSubagentLineage(createRootLineage("root", "/tmp/root.jsonl"), {
       id: "abc12345",
       name: "worker",
@@ -129,6 +131,40 @@ describe("Pi Harness Driver", () => {
     assert.equal(driver.hasActivitySnapshots, true);
   });
 
+  it("adds recursive management tools when native tools are explicitly restricted", () => {
+    const policy = createEffectiveSubagentPolicy({
+      effectiveTools: "read,bash,write",
+      agent: "worker",
+    });
+    const built = driver.buildCommand(createMockLaunchContext({
+      policy,
+      denySet: new Set(policy.deniedTools),
+    }));
+
+    assert.ok(
+      built.command.includes(
+        "--tools 'read,bash,write,caller_ping,subagent_done,subagent,subagent_interrupt,subagents_list,subagent_resume'",
+      ),
+    );
+  });
+
+  it("keeps semantic spawning restrictions out of the Pi model surface", () => {
+    const policy = createEffectiveSubagentPolicy({
+      spawning: false,
+      effectiveTools: "read,bash",
+      agent: "restricted",
+    });
+    const built = driver.buildCommand(createMockLaunchContext({
+      policy,
+      denySet: new Set(policy.deniedTools),
+    }));
+
+    assert.ok(built.command.includes("--tools 'read,bash,caller_ping,subagent_done'"));
+    assert.ok(built.command.includes("--append-system-prompt '/tmp/artifacts/context/subagent-policy-abc12345.md'"));
+    assert.ok(built.command.includes("PI_SUBAGENT_SPAWNING=0"));
+    assert.ok(built.command.includes("PI_DENY_TOOLS='subagent,subagent_interrupt,subagent_resume,subagents_list'"));
+  });
+
   it("builds correct pi invocation command", () => {
     const ctx = createMockLaunchContext({
       effectiveModel: "anthropic/claude-sonnet-4-5",
@@ -140,6 +176,7 @@ describe("Pi Harness Driver", () => {
     assert.ok(built.command.includes("pi --session '/tmp/sessions/subagent.jsonl'"));
     assert.ok(built.command.includes("--model 'anthropic/claude-sonnet-4-5'"));
     assert.ok(built.command.includes("--thinking 'high'"));
+    assert.ok(built.command.includes("PI_SUBAGENT_SPAWNING=1"));
     assert.ok(built.command.includes("PI_SUBAGENT_DEPTH='1'"));
     assert.ok(built.command.includes("PI_SUBAGENT_LINEAGE='{\"version\":1"));
     assert.ok(built.command.includes("echo '__SUBAGENT_DONE_'$?'__'"));

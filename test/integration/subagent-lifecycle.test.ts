@@ -25,6 +25,7 @@ import {
   createTestEnv,
   cleanupTestEnv,
   createTrackedSurface,
+  dumpWorkspacePanes,
   startPi,
   waitForScreen,
   waitForFile,
@@ -151,6 +152,45 @@ for (const backend of backends) {
         300,
       );
       assert.ok(/STATUS_TEST_DONE|completed/i.test(completionScreen));
+    });
+
+    // ── Recursive spawn through a native tool allowlist ──
+
+    it("lets a native-tools-restricted child spawn a grandchild", async () => {
+      const id = uniqueId();
+      const markerFile = `/tmp/pi-integ-recursive-${id}.txt`;
+      trackTempFile(env, markerFile);
+
+      const surface = createTrackedSurface(env, `recursive-${id}`);
+      await sleep(1000);
+
+      const childTask = [
+        `Call the subagent tool with these EXACT parameters:`,
+        `  name: "Grandchild-${id}"`,
+        `  agent: "test-echo"`,
+        `  task: "Run: echo 'RECURSIVE_${id}' > '${markerFile}'"`,
+        `Do not write the marker yourself. After the grandchild result arrives, summarize success.`,
+      ].join("\n");
+      const task = [
+        `Call the subagent tool with these EXACT parameters:`,
+        `  name: "RestrictedChild-${id}"`,
+        `  agent: "test-recursive"`,
+        `  task: ${JSON.stringify(childTask)}`,
+        `Do not do anything else before calling it.`,
+      ].join("\n");
+
+      startPi(surface, env.dir, task);
+
+      let content: string;
+      try {
+        content = await waitForFile(markerFile, PI_TIMEOUT * 2, /RECURSIVE_/);
+      } catch (error) {
+        throw new Error(`${String(error)}\nWorkspace panes:\n${dumpWorkspacePanes(env)}`);
+      }
+      assert.ok(
+        content.includes(`RECURSIVE_${id}`),
+        `Grandchild marker should contain RECURSIVE_${id}`,
+      );
     });
 
     // ── Parallel subagent spawn ──

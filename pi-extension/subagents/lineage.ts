@@ -1,3 +1,5 @@
+import { formatSpawningPolicyGuidance } from "./policy.ts";
+
 export const SUBAGENT_LINEAGE_VERSION = 1 as const;
 
 export interface SubagentLineageRoot {
@@ -153,9 +155,14 @@ export function readSubagentLineageFromEnvironment(
   return lineage;
 }
 
-export function formatSubagentIdentity(lineage: SubagentLineage): string {
+export function formatSubagentIdentity(
+  lineage: SubagentLineage,
+  options: { spawningAllowed?: boolean } = {},
+): string {
   const valid = validateSubagentLineage(lineage);
   const depth = valid.chain.length;
+  const spawningAllowed = options.spawningAllowed ?? true;
+  const spawningGuidance = formatSpawningPolicyGuidance(spawningAllowed);
   const lines = [
     "<subagent_identity>",
     `You are a delegated subagent at recursion depth ${depth}. The root session is depth 0.`,
@@ -165,14 +172,16 @@ export function formatSubagentIdentity(lineage: SubagentLineage): string {
       `- depth ${node.depth}: ${node.name}${node.agent ? ` [agent=${node.agent}]` : ""} ` +
       `(id=${node.id}, session=${node.sessionFile})`
     ),
-    "Recursive delegation is allowed. Before creating a child, account for your current depth and this full ancestry. " +
-      "Delegate only when another layer has clear value; do not re-delegate the same or a broader task, duplicate work already represented in the lineage, or create fan-out merely because an earlier attempt was slow or blocked.",
-    "Any child launched through the subagent tool will receive this lineage with its own node appended.",
+    ...spawningGuidance,
     "</subagent_identity>",
   ];
   return lines.join("\n");
 }
 
-export function prependSubagentIdentity(task: string, lineage: SubagentLineage): string {
-  return `${formatSubagentIdentity(lineage)}\n\n${task}`;
+export function prependSubagentIdentity(
+  task: string,
+  lineage: SubagentLineage,
+  options: { spawningAllowed?: boolean } = {},
+): string {
+  return `${formatSubagentIdentity(lineage, options)}\n\n${task}`;
 }

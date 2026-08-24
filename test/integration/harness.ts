@@ -229,6 +229,31 @@ export function createTrackedSurface(env: TestEnv, name: string): string {
   return surface;
 }
 
+/** Capture every pane in the dedicated test workspace before cleanup removes it. */
+export function dumpWorkspacePanes(env: TestEnv, lines = 160): string {
+  try {
+    const output = execFileSync("herdr", ["pane", "list"], { encoding: "utf8" });
+    const parsed = JSON.parse(output) as {
+      result?: { panes?: Array<{ pane_id?: unknown; workspace_id?: unknown; label?: unknown }> };
+    };
+    const panes = (parsed.result?.panes ?? []).filter(
+      (pane) => pane.workspace_id === env.workspaceId && typeof pane.pane_id === "string",
+    );
+    return panes.map((pane) => {
+      const paneId = pane.pane_id as string;
+      let screen = "";
+      try {
+        screen = readPane(paneId, lines);
+      } catch (error) {
+        screen = `[read failed: ${String(error)}]`;
+      }
+      return `--- ${paneId}${typeof pane.label === "string" ? ` (${pane.label})` : ""} ---\n${screen}`;
+    }).join("\n");
+  } catch (error) {
+    return `[workspace dump failed: ${String(error)}]`;
+  }
+}
+
 /**
  * Remove a surface from tracking (after manual close).
  */

@@ -55,9 +55,16 @@ import {
   findObservedSessionRuntime,
   getNewEntries,
   readSubagentLineageFromSessionFile,
+  readSubagentPolicyFromSessionFile,
   seedSubagentSessionFile,
   writeSubagentLineageToSessionFile,
 } from "./session.ts";
+import {
+  createEffectiveSubagentPolicy,
+  parseSpawningBoolean,
+  readSpawningFromEnvironment,
+  SUBAGENT_MANAGEMENT_TOOLS,
+} from "./policy.ts";
 import {
   type SubagentStatusState,
   capStatusLines,
@@ -117,9 +124,10 @@ function buildSubagentRoutingGuidelines(
   modelCatalog?: string,
   agentCatalog?: string,
   lineage?: SubagentLineage | null,
+  spawningAllowed = true,
 ): string[] {
   return [
-    ...(lineage ? [formatSubagentIdentity(lineage)] : []),
+    ...(lineage ? [formatSubagentIdentity(lineage, { spawningAllowed })] : []),
     "Choose the named agent whose description most closely matches the task; do not use one agent as a generic default.",
     "Omit model and thinking when invoking a named agent so its configured defaults apply. Passing either field is an explicit one-off override and takes precedence over agent frontmatter.",
     "For a bare spawn, omit model and thinking to inherit the parent runtime.",
@@ -131,10 +139,12 @@ function buildSubagentRoutingGuidelines(
 }
 
 const inheritedLineage = readSubagentLineageFromEnvironment();
+const inheritedSpawningAllowed = readSpawningFromEnvironment();
 const subagentRoutingGuidelines = buildSubagentRoutingGuidelines(
   undefined,
   undefined,
   inheritedLineage,
+  inheritedSpawningAllowed,
 );
 
 const ThinkingLevelSchema = Type.Union(
@@ -228,17 +238,9 @@ interface ListedAgentDefinition extends AgentDefinition {
   source: AgentSource;
 }
 
-/** Tools that are gated by `spawning: false` */
-const SPAWNING_TOOLS = new Set([
-  "subagent",
-  "subagent_interrupt",
-  "subagents_list",
-  "subagent_resume",
-]);
-
 /**
  * Resolve the effective set of denied tool names from agent defaults.
- * `spawning: false` expands to all SPAWNING_TOOLS.
+ * `spawning: false` expands to all management tools.
  * `deny-tools` adds individual tool names on top.
  */
 function resolveDenyTools(agentDefs: AgentDefaults | null): Set<string> {
@@ -247,7 +249,7 @@ function resolveDenyTools(agentDefs: AgentDefaults | null): Set<string> {
 
   // spawning: false → deny all spawning tools
   if (agentDefs.spawning === false) {
-    for (const t of SPAWNING_TOOLS) denied.add(t);
+    for (const t of SUBAGENT_MANAGEMENT_TOOLS) denied.add(t);
   }
 
   // deny-tools: explicit list
@@ -318,7 +320,7 @@ function parseAgentDefinition(content: string, fallbackName: string): AgentDefin
     skills: getFrontmatterValue(frontmatter, "skill") ?? getFrontmatterValue(frontmatter, "skills"),
     thinking: getFrontmatterValue(frontmatter, "thinking"),
     denyTools: getFrontmatterValue(frontmatter, "deny-tools"),
-    spawning: parseOptionalBoolean(getFrontmatterValue(frontmatter, "spawning")),
+    spawning: parseSpawningBoolean(getFrontmatterValue(frontmatter, "spawning")),
     autoExit: parseOptionalBoolean(getFrontmatterValue(frontmatter, "auto-exit")),
     interactive: parseOptionalBoolean(getFrontmatterValue(frontmatter, "interactive")),
     sessionMode: parseSessionMode(getFrontmatterValue(frontmatter, "session-mode")),
@@ -344,17 +346,17 @@ function discoverAgentDefinitions(): ListedAgentDefinition[] {
   for (const { path: dir, source } of dirs) {
     if (!existsSync(dir)) continue;
     for (const file of readdirSync(dir).filter((entry) => entry.endsWith(".md"))) {
+      let content: string;
       try {
-        const parsed = parseAgentDefinition(
-          readFileSync(join(dir, file), "utf8"),
-          file.replace(/\.md$/, ""),
-        );
-        if (!parsed) continue;
-        agents.set(parsed.name, { ...parsed, source });
+        content = readFileSync(join(dir, file), "utf8");
       } catch {
         // Skip unreadable or racy entries rather than aborting discovery
         // for every other agent definition.
+        continue;
       }
+      const parsed = parseAgentDefinition(content, file.replace(/\.md$/, ""));
+      if (!parsed) continue;
+      agents.set(parsed.name, { ...parsed, source });
     }
   }
 
@@ -1102,6 +1104,8 @@ export const __test__ = {
   buildPiPromptArgs,
   observeRunningSubagent,
   resolveDenyTools,
+  parseAgentDefinition,
+  parseSpawningBoolean,
   resolveInterruptTarget,
   requestSubagentInterrupt,
   handleSubagentInterrupt,
@@ -1204,6 +1208,12 @@ async function launchSubagent(
   }
 
   const launchBehavior = resolveLaunchBehavior(params, agentDefs);
+  const policy = createEffectiveSubagentPolicy({
+    spawning: agentDefs?.spawning,
+    denyTools: agentDefs?.denyTools,
+    effectiveTools: params.tools ?? agentDefs?.tools,
+    agent: params.agent,
+  });
 
   seedSubagentSessionFile({
     mode: launchBehavior.seededSessionMode,
@@ -1211,6 +1221,7 @@ async function launchSubagent(
     childSessionFile: subagentSessionFile,
     childCwd: targetCwdForSession,
     lineage: childLineage,
+    policy,
   });
 
   const activityFile = getSubagentActivityFile(artifactDir, id);
@@ -1228,7 +1239,7 @@ async function launchSubagent(
   const summaryInstruction = effectiveAutoExit
     ? "Your FINAL assistant message should summarize what you accomplished."
     : "Your FINAL assistant message (before calling subagent_done or before the user exits) should summarize what you accomplished.";
-  const denySet = resolveDenyTools(agentDefs);
+  const denySet = new Set(policy.deniedTools);
   const identity = agentDefs?.body ?? params.systemPrompt ?? null;
   const systemPromptMode = agentDefs?.systemPromptMode;
   const identityInSystemPrompt = systemPromptMode && identity;
@@ -1239,7 +1250,9 @@ async function launchSubagent(
     params: {
       ...params,
       id,
-      task: prependSubagentIdentity(params.task, childLineage),
+      task: prependSubagentIdentity(params.task, childLineage, {
+        spawningAllowed: policy.spawning,
+      }),
     },
     agentDefs,
     runtimePlan,
@@ -1257,6 +1270,7 @@ async function launchSubagent(
     inheritsConversationContext,
     taskDelivery: launchBehavior.taskDelivery,
     denySet,
+    policy,
     identity,
     identityInSystemPrompt: Boolean(identityInSystemPrompt),
     systemPromptMode,
@@ -1477,6 +1491,12 @@ export default function subagentsExtension(pi: ExtensionAPI) {
     const persistedLineage = currentSessionFile
       ? readSubagentLineageFromSessionFile(currentSessionFile)
       : null;
+    const persistedPolicy = currentSessionFile
+      ? readSubagentPolicyFromSessionFile(currentSessionFile)
+      : null;
+    const spawningAllowed = process.env.PI_SUBAGENT_ID
+      ? inheritedSpawningAllowed
+      : persistedPolicy?.spawning ?? true;
     runtime.currentLineage = inheritedLineage ?? persistedLineage ?? (
       currentSessionFile && currentSessionId
         ? createRootLineage(currentSessionId, currentSessionFile)
@@ -1490,6 +1510,7 @@ export default function subagentsExtension(pi: ExtensionAPI) {
       runtime.modelCatalog,
       runtime.agentCatalog,
       runtime.currentLineage,
+      spawningAllowed,
     );
     subagentRoutingGuidelines.splice(0, subagentRoutingGuidelines.length, ...refreshedGuidelines);
     if (runningSubagents.size > 0) {
@@ -1945,15 +1966,6 @@ export default function subagentsExtension(pi: ExtensionAPI) {
             details: { error: "no session file" },
           };
         }
-        const parentLineage = runtime.currentLineage ??
-          readSubagentLineageFromEnvironment() ??
-          createRootLineage(ctx.sessionManager.getSessionId(), parentSessionFile);
-        const resumeLineage = appendSubagentLineage(parentLineage, {
-          id,
-          name,
-          sessionFile: params.sessionPath,
-        });
-
         if (!isTerminalAvailable()) {
           return muxUnavailableResult();
         }
@@ -1967,10 +1979,34 @@ export default function subagentsExtension(pi: ExtensionAPI) {
           };
         }
 
+        const previousLineage = readSubagentLineageFromSessionFile(params.sessionPath);
+        const persistedPolicy = readSubagentPolicyFromSessionFile(params.sessionPath);
+        if (!persistedPolicy) {
+          return {
+            content: [{
+              type: "text",
+              text:
+                "Error: this session predates persisted subagent tool policy and cannot be resumed safely without guessing its capabilities. Start a new subagent instead.",
+            }],
+            details: { error: "missing persisted subagent policy" },
+          };
+        }
+        const retainedAgent = persistedPolicy.agent ?? previousLineage?.chain.at(-1)?.agent;
+        const policy = persistedPolicy;
+        const parentLineage = runtime.currentLineage ??
+          readSubagentLineageFromEnvironment() ??
+          createRootLineage(ctx.sessionManager.getSessionId(), parentSessionFile);
+        const resumeLineage = appendSubagentLineage(parentLineage, {
+          id,
+          name,
+          sessionFile: params.sessionPath,
+          ...(retainedAgent ? { agent: retainedAgent } : {}),
+        });
+
         // Record entry count before resuming so we can extract new messages,
-        // then persist the new execution lineage for future Herdr restoration.
+        // then persist the execution lineage and unchanged effective policy.
         const entryCountBefore = getNewEntries(params.sessionPath, 0).length;
-        writeSubagentLineageToSessionFile(params.sessionPath, resumeLineage);
+        writeSubagentLineageToSessionFile(params.sessionPath, resumeLineage, policy);
 
         const surface = createSubagentPane(name);
         if (params.message) {
@@ -1984,6 +2020,9 @@ export default function subagentsExtension(pi: ExtensionAPI) {
         // Load subagent-done extension so the agent can self-terminate if needed
         const subagentDonePath = join(SUBAGENTS_DIR, "subagent-done.ts");
         parts.push("-e", shellQuote(subagentDonePath));
+        if (policy.toolAllowlist) {
+          parts.push("--tools", shellQuote(policy.toolAllowlist.join(",")));
+        }
 
         const sessionId = ctx.sessionManager.getSessionId();
         const artifactDir = getArtifactDir(ctx.sessionManager.getSessionDir(), sessionId);
@@ -2006,10 +2045,28 @@ export default function subagentsExtension(pi: ExtensionAPI) {
           mkdirSync(dirname(resumeMsgFile), { recursive: true });
           writeFileSync(
             resumeMsgFile,
-            prependSubagentIdentity(params.message, resumeLineage),
+            prependSubagentIdentity(params.message, resumeLineage, {
+              spawningAllowed: policy.spawning,
+            }),
             "utf8",
           );
           parts.push(shellQuote(`@${resumeMsgFile}`));
+        }
+
+        let resumePolicyFile: string | undefined;
+        if (!policy.spawning) {
+          resumePolicyFile = join(
+            artifactDir,
+            "subagent-resume",
+            `policy-${id}.md`,
+          );
+          mkdirSync(dirname(resumePolicyFile), { recursive: true });
+          writeFileSync(
+            resumePolicyFile,
+            formatSubagentIdentity(resumeLineage, { spawningAllowed: false }),
+            "utf8",
+          );
+          parts.push("--append-system-prompt", shellQuote(resumePolicyFile));
         }
 
         // Build env prefix — propagate PI_CODING_AGENT_DIR for config isolation
@@ -2017,7 +2074,14 @@ export default function subagentsExtension(pi: ExtensionAPI) {
         if (process.env.PI_CODING_AGENT_DIR) {
           resumeEnvParts.push(`PI_CODING_AGENT_DIR=${shellQuote(process.env.PI_CODING_AGENT_DIR)}`);
         }
+        if (policy.deniedTools.length > 0) {
+          resumeEnvParts.push(`PI_DENY_TOOLS=${shellQuote(policy.deniedTools.join(","))}`);
+        }
+        resumeEnvParts.push(`PI_SUBAGENT_SPAWNING=${policy.spawning ? "1" : "0"}`);
         resumeEnvParts.push(`PI_SUBAGENT_NAME=${shellQuote(name)}`);
+        if (retainedAgent) {
+          resumeEnvParts.push(`PI_SUBAGENT_AGENT=${shellQuote(retainedAgent)}`);
+        }
         resumeEnvParts.push(`PI_SUBAGENT_SESSION=${shellQuote(params.sessionPath)}`);
         resumeEnvParts.push(`PI_SUBAGENT_ID=${shellQuote(id)}`);
         resumeEnvParts.push(`PI_SUBAGENT_DEPTH=${shellQuote(String(resumeLineage.chain.length))}`);
@@ -2047,6 +2111,7 @@ export default function subagentsExtension(pi: ExtensionAPI) {
             `# Session: ${params.sessionPath}`,
             `# Surface: ${surface}`,
             ...(resumeMsgFile ? [`# Resume message file: ${resumeMsgFile}`] : []),
+            ...(resumePolicyFile ? [`# Resume policy file: ${resumePolicyFile}`] : []),
           ].join("\n"),
         });
 
@@ -2055,6 +2120,7 @@ export default function subagentsExtension(pi: ExtensionAPI) {
           id,
           name,
           task: params.message ?? "resumed session",
+          agent: retainedAgent,
           surface,
           startTime,
           sessionFile: params.sessionPath,

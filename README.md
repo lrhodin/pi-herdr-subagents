@@ -127,7 +127,9 @@ Agents default to running with `pi`, but can run inside any supported harness CL
 5. Main agent processes result     → continues with new context
 ```
 
-Multiple subagents run concurrently — each steers its result back independently as it finishes. Recursive delegation is also supported. Every child receives an immutable root-to-self lineage, including its numeric recursion depth, through `PI_SUBAGENT_LINEAGE` and `PI_SUBAGENT_DEPTH`; the same identity is injected into its task and subagent-tool guidance. A child can therefore decide whether another layer is useful with full knowledge of how deeply nested it already is. The lineage is appended—not reset—when that child delegates again, and is persisted in the child session header as `subagentLineage` / `subagentDepth`.
+Multiple subagents run concurrently — each steers its result back independently as it finishes. Recursive delegation is enabled by default, including for Pi agents whose frontmatter has an explicit native `tools:` allowlist. The extension automatically adds `subagent`, `subagent_interrupt`, `subagents_list`, and `subagent_resume` unless each tool is individually denied or `spawning: false` disables management as a whole.
+
+Every child receives an immutable root-to-self lineage, including its numeric recursion depth, through `PI_SUBAGENT_LINEAGE` and `PI_SUBAGENT_DEPTH`; the same identity is injected into its task and subagent-tool guidance. A child can therefore decide whether another layer is useful with full knowledge of how deeply nested it already is. The lineage is appended—not reset—when that child delegates again. Lineage and effective tool/spawning policy are persisted in the child session header, then restored by `subagent_resume` so a restricted session cannot regain tools when resumed.
 
 The live widget above the input tracks every agent still in flight:
 
@@ -275,6 +277,8 @@ The `caller_ping` tool lets a subagent request help from its parent agent. When 
 - `message` (optional): Follow-up prompt to send after resuming
 - `autoExit` (optional): Whether the resumed session should auto-exit after its next response. Defaults to `true` for autonomous follow-up work; set `false` when resuming for an interactive handoff.
 
+For safety, `subagent_resume` refuses legacy sessions that predate persisted tool-policy metadata rather than guessing and potentially escalating their capabilities. Start a new subagent for those sessions.
+
 **Interaction flow:**
 1. Child calls `caller_ping({ message: "Not sure which schema to use" })`
 2. Child session exits (like `subagent_done`)
@@ -356,10 +360,10 @@ You are a specialized agent that does X...
 | `description` | string  | Shown in `subagents_list` output                                                                                                                                                                                                                                            |
 | `model`       | string  | Optional exact authenticated model default; omit to inherit the parent                                                                                                                                                                                                      |
 | `thinking`    | string  | Optional Pi thinking default (`off` through `max`); omit to inherit the parent                                                                                                                                                                                                                                 |
-| `tools`       | string  | Comma-separated **native pi tools only**: `read`, `bash`, `edit`, `write`, `grep`, `find`, `ls`                                                                                                                                                                             |
+| `tools`       | string  | Comma-separated **native Pi tools** such as `read`, `bash`, `edit`, and `write`. Recursive management tools are added automatically by default.                                                                                                                                  |
 | `skills`      | string  | Comma-separated skill names to auto-load                                                                                                                                                                                                                                    |
 | `session-mode` | string | Default child-session mode: `standalone`, `lineage-only`, or `fork` |
-| `spawning`    | boolean | Set `false` to deny all subagent-spawning tools                                                                                                                                                                                                                             |
+| `spawning`    | boolean | Defaults to `true`. Set the boolean `false` to remove all subagent management tools; other values are rejected.                                                                                                                                                            |
 | `deny-tools`  | string  | Comma-separated extension tool names to deny                                                                                                                                                                                                                                |
 | `auto-exit`   | boolean | Auto-shutdown when the agent finishes its turn — no `subagent_done` call needed. If the user sends any input, auto-exit is permanently disabled and the user takes over the session. Recommended for autonomous agents (scout, worker); not for interactive ones (planner). Also determines the default value of `interactive` (see below). |
 | `interactive` | boolean | derived        | Override whether stall/recovery transitions wake the parent session. Defaults to the inverse of `auto-exit`: autonomous agents (`auto-exit: true`) are non-interactive and get stall pings; agents without `auto-exit` are interactive and stay quiet. Explicit values take precedence. |
@@ -441,11 +445,11 @@ subagent({ name: "Scout", agent: "scout", interactive: true, task: "..." });
 
 ## Tool Access Control
 
-By default, every sub-agent can spawn further sub-agents. Control this with frontmatter:
+By default, every sub-agent can spawn and manage further sub-agents. This remains true when `tools:` restricts native Pi tools: the four management tools are added automatically unless denied. Control recursion with frontmatter:
 
 ### `spawning: false`
 
-Denies all subagent lifecycle tools (`subagent`, `subagent_interrupt`, `subagents_list`, `subagent_resume`):
+Removes all subagent lifecycle tools (`subagent`, `subagent_interrupt`, `subagents_list`, `subagent_resume`) from registration and from the model-visible allowlist:
 
 ```yaml
 ---
@@ -467,13 +471,14 @@ deny-tools: subagent
 
 ### Recommended Configuration
 
-| Agent      | `spawning`  | Rationale                                    |
-| ---------- | ----------- | -------------------------------------------- |
-| planner    | _(default)_ | Legitimately spawns scouts for investigation |
-| worker     | `false`     | Should implement tasks, not delegate         |
-| researcher | `false`     | Should research, not spawn                   |
-| reviewer   | `false`     | Should review, not spawn                     |
-| scout      | `false`     | Should gather context, not spawn             |
+| Agent         | `spawning`  | Rationale                                                   |
+| ------------- | ----------- | ----------------------------------------------------------- |
+| planner       | _(default)_ | Can delegate factual gaps                                   |
+| worker        | _(default)_ | Can delegate a narrower specialist task when useful         |
+| researcher    | _(default)_ | Can split genuinely independent research when useful        |
+| reviewer      | _(default)_ | Can delegate a narrowly scoped verification when useful     |
+| scout         | _(default)_ | Can delegate a narrower codebase question when useful       |
+| restricted    | `false`     | Explicitly has no recursive management capability           |
 
 ---
 
@@ -512,13 +517,14 @@ spawning: false
 
 ## Tools Widget
 
-Every sub-agent session displays a compact tools widget showing available and denied tools. Toggle with `Ctrl+J`:
+Every sub-agent session displays a compact tools widget grounded in Pi's active, model-visible tool list. Toggle with `Alt+J`:
 
 ```
-[scout] — 12 tools · 4 denied  (Ctrl+J)              ← collapsed
-[scout] — 12 available  (Ctrl+J to collapse)          ← expanded
-  read, bash, edit, write, todo, ...
-  denied: subagent, subagents_list, ...
+[scout] — 12 tools  (Alt+J)                            ← collapsed
+[scout] — 12 available  (Alt+J to collapse)            ← expanded
+  read, bash, edit, write, subagent, ...
+
+[restricted] — 8 tools · recursive spawning disabled  (Alt+J)
 ```
 
 ---
