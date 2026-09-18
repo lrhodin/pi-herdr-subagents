@@ -122,7 +122,24 @@ export function parseDeniedTools(rawValue: string | undefined): string[] {
     .filter(Boolean);
 }
 
+export function createTerminalPublisher(file: string | undefined, executionId?: string) {
+  let published = false;
+  return (payload: object): boolean => {
+    if (published) return false;
+    // Latch before writing: settled must never publish a second terminal result,
+    // including after caller_ping/subagent_done requested shutdown.
+    published = true;
+    if (file) writeFileSync(file, JSON.stringify({ ...payload, ...(executionId ? { executionId } : {}) }));
+    return true;
+  };
+}
+
 export default function (pi: ExtensionAPI) {
+  const sessionFile = process.env.PI_SUBAGENT_SESSION;
+  const publishTerminal = createTerminalPublisher(
+    process.env.PI_SUBAGENT_COMPLETION_FILE ?? (sessionFile ? `${sessionFile}.exit` : undefined),
+    process.env.PI_SUBAGENT_ID,
+  );
   let toolNames: string[] = [];
   let denied: string[] = [];
   let expanded = false;
@@ -252,17 +269,10 @@ export default function (pi: ExtensionAPI) {
       // Surface stopReason: "error" turns (auto-retry exhausted, provider
       // overload, etc.) to the parent via the .exit sidecar so the watcher
       // can report a clear failure with the underlying error message.
-      const sessionFile = process.env.PI_SUBAGENT_SESSION;
-      if (sessionFile) {
-        try {
-          writeFileSync(
-            `${sessionFile}.exit`,
-            JSON.stringify(buildCompletionSidecar(latestAgentMessages)),
-          );
-        } catch {
-          // Best effort — the watcher can still detect the terminal sentinel
-          // after shutdown if the completion sidecar cannot be written.
-        }
+      try {
+        publishTerminal(buildCompletionSidecar(latestAgentMessages));
+      } catch {
+        // The watcher can still detect the terminal sentinel after shutdown.
       }
 
       recorder.agentEndDone();
@@ -355,7 +365,7 @@ export default function (pi: ExtensionAPI) {
         name: process.env.PI_SUBAGENT_NAME ?? "subagent",
         message: params.message,
       };
-      writeFileSync(`${sessionFile}.exit`, JSON.stringify(exitData));
+      publishTerminal(exitData);
 
       ctx.shutdown();
       return {
@@ -374,11 +384,8 @@ export default function (pi: ExtensionAPI) {
       "Your LAST assistant message before calling this becomes the summary returned to the caller.",
     parameters: Type.Object({}),
     async execute(_toolCallId, _params, _signal, _onUpdate, ctx) {
-      const sessionFile = process.env.PI_SUBAGENT_SESSION;
       recorder.subagentDone();
-      if (sessionFile) {
-        writeFileSync(`${sessionFile}.exit`, JSON.stringify({ type: "done" }));
-      }
+      publishTerminal({ type: "done" });
       ctx.shutdown();
       return {
         content: [{ type: "text", text: "Shutting down subagent session." }],

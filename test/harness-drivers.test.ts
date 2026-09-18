@@ -143,7 +143,7 @@ describe("Pi Harness Driver", () => {
 
     assert.ok(
       built.command.includes(
-        "--tools 'read,bash,write,caller_ping,subagent_done,subagent,subagent_interrupt,subagents_list,subagent_resume'",
+        "--tools 'read,bash,write,caller_ping,subagent_done,list_models,subagent,subagent_interrupt,subagents_list,subagent_resume'",
       ),
     );
   });
@@ -159,7 +159,7 @@ describe("Pi Harness Driver", () => {
       denySet: new Set(policy.deniedTools),
     }));
 
-    assert.ok(built.command.includes("--tools 'read,bash,caller_ping,subagent_done'"));
+    assert.ok(built.command.includes("--tools 'read,bash,caller_ping,subagent_done,list_models'"));
     assert.ok(built.command.includes("--append-system-prompt '/tmp/artifacts/context/subagent-policy-abc12345.md'"));
     assert.ok(built.command.includes("PI_SUBAGENT_SPAWNING=0"));
     assert.ok(built.command.includes("PI_DENY_TOOLS='subagent,subagent_interrupt,subagent_resume,subagents_list'"));

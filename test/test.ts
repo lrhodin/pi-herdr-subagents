@@ -1,3 +1,4 @@
+import { execFileSync } from "node:child_process";
 import { describe, it, before, after } from "node:test";
 import assert from "node:assert/strict";
 import { existsSync, mkdtempSync, writeFileSync, readFileSync, mkdirSync, rmSync } from "node:fs";
@@ -7,6 +8,7 @@ import { fileURLToPath } from "node:url";
 import { visibleWidth } from "@earendil-works/pi-tui";
 import * as subagentsModule from "../pi-extension/subagents/index.ts";
 import {
+  cleanupDeliveredSubagentPane,
   cleanupSubagentsForShutdown,
   selectCompletionApi,
   shouldDeliverSubagentCompletion,
@@ -74,7 +76,7 @@ import subagentDoneExtension, {
   isUserAbortMessage,
   buildCompletionSidecar,
 } from "../pi-extension/subagents/subagent-done.ts";
-import { interpretExitSidecar, waitForCompletion } from "../pi-extension/subagents/completion.ts";
+import { executionCompletionFile, interpretExitSidecar, waitForCompletion } from "../pi-extension/subagents/completion.ts";
 import {
   createLifecycle,
   lifecycleTransition,
@@ -1273,14 +1275,14 @@ describe("subagent discovery", () => {
       false,
     );
 
-    // Named agents without auto-exit preserve their interactive behavior.
+    // Named agents without auto-exit still receive parent supervision.
     assert.equal(
       testApi.resolveEffectiveAutoExit({ name: "A", task: "T" }, { autoExit: false }),
       false,
     );
     assert.equal(
       testApi.resolveEffectiveInteractive({ name: "A", task: "T" }, { autoExit: false }),
-      true,
+      false,
     );
 
     // Bare task spawns are autonomous by default. Otherwise a normal final
@@ -1316,14 +1318,14 @@ describe("subagent discovery", () => {
     );
   });
 
-  it("resolveEffectiveInteractive honors explicit frontmatter over the auto-exit default", () => {
+  it("resolveEffectiveInteractive does not treat legacy frontmatter as user consent", () => {
     // Autonomous agent that still wants to be treated as interactive.
     assert.equal(
       testApi.resolveEffectiveInteractive(
         { name: "A", task: "T" },
         { autoExit: true, interactive: true },
       ),
-      true,
+      false,
     );
     // Non-auto-exit agent that opts back into stall pings.
     assert.equal(
@@ -1333,6 +1335,15 @@ describe("subagent discovery", () => {
       ),
       false,
     );
+  });
+
+  it("explicit user control disables auto-exit even for named autonomous agents", () => {
+    assert.equal(testApi.resolveEffectiveAutoExit(
+      { name: "A", task: "T", interactive: true }, { autoExit: true },
+    ), false);
+    for (const defs of [null, {}, { autoExit: false }, { interactive: true }]) {
+      assert.equal(testApi.resolveEffectiveInteractive({ name: "A", task: "T" }, defs), false);
+    }
   });
 
   it("resolveEffectiveInteractive honors the explicit tool parameter over all else", () => {
@@ -1358,7 +1369,7 @@ describe("subagent discovery", () => {
         scout: false,
         worker: false,
         reviewer: false,
-        planner: true,
+        planner: false,
         "visual-tester": false,
       } as const;
 
@@ -1452,7 +1463,7 @@ describe("subagent discovery", () => {
   it("buildSubagentToolAllowlist adds control and management tools to native allowlists", () => {
     assert.equal(
       testApi.buildSubagentToolAllowlist("read,bash,web_search"),
-      "read,bash,web_search,caller_ping,subagent_done,subagent,subagent_interrupt,subagents_list,subagent_resume",
+      "read,bash,web_search,caller_ping,subagent_done,list_models,subagent,subagent_interrupt,subagents_list,subagent_resume",
     );
   });
 
@@ -1462,7 +1473,7 @@ describe("subagent discovery", () => {
         "read,bash",
         new Set(["subagent_resume"]),
       ),
-      "read,bash,caller_ping,subagent_done,subagent,subagent_interrupt,subagents_list",
+      "read,bash,caller_ping,subagent_done,list_models,subagent,subagent_interrupt,subagents_list",
     );
   });
 
@@ -1500,6 +1511,49 @@ describe("subagent discovery", () => {
       testApi.buildPiPromptArgs({ effectiveSkills: "review", taskDelivery: "direct", taskArg: "do the task" }),
       ["/skill:review", "do the task"],
     );
+  });
+
+  it("lists live authenticated models in parent and child contexts and honors denies", async () => {
+    const previousId = process.env.PI_SUBAGENT_ID;
+    const previousDenied = process.env.PI_DENY_TOOLS;
+    try {
+      for (const child of [false, true]) {
+        if (child) process.env.PI_SUBAGENT_ID = "catalog-test";
+        else delete process.env.PI_SUBAGENT_ID;
+        const { api, registeredTools } = createMockExtensionApi();
+        (subagentsModule as any).default(api);
+        const tool = registeredTools.find((tool) => tool.name === "list_models");
+        assert.ok(tool);
+        let available = [{ provider: "custom", id: "nested/model", name: "Friendly Flash", reasoning: false }];
+        const ctx = { modelRegistry: { find() {}, getAvailable: () => available } };
+        const result = await tool.execute("id", { query: "FLASH" }, undefined, undefined, ctx);
+        assert.match(result.content[0].text, /custom\/nested\/model \(Friendly Flash\)/);
+        const exact = await tool.execute("id", { query: " CUSTOM/NESTED " }, undefined, undefined, ctx);
+        assert.equal(exact.details.count, 1);
+        const unmatched = await tool.execute("id", { query: "missing" }, undefined, undefined, ctx);
+        assert.equal(unmatched.details.count, 0);
+        available = Array.from({ length: 101 }, (_, index) => ({ provider: "custom", id: `model-${index}`, name: "Flash", reasoning: false }));
+        const limited = await tool.execute("id", {}, undefined, undefined, ctx);
+        assert.equal(limited.details.count, 101);
+        assert.equal(limited.content[0].text.split("\n").filter((line: string) => line.startsWith("- custom/")).length, 100);
+        assert.match(limited.content[0].text, /1 more authenticated models omitted/);
+        available = [];
+        const empty = await tool.execute("id", {}, undefined, undefined, ctx);
+        assert.equal(empty.details.count, 0);
+        assert.doesNotMatch(empty.content[0].text, /nested\/model/);
+      }
+      process.env.PI_DENY_TOOLS = "list_models";
+      const { api, registeredTools } = createMockExtensionApi();
+      (subagentsModule as any).default(api);
+      assert.equal(registeredTools.some((tool) => tool.name === "list_models"), false);
+      const policy = createEffectiveSubagentPolicy({ effectiveTools: "read", spawning: false });
+      assert.ok(policy.toolAllowlist?.includes("list_models"));
+      const denied = createEffectiveSubagentPolicy({ effectiveTools: "read,list_models", denyTools: "list_models" });
+      assert.equal(denied.toolAllowlist?.includes("list_models"), false);
+    } finally {
+      restoreEnvVar("PI_SUBAGENT_ID", previousId);
+      restoreEnvVar("PI_DENY_TOOLS", previousDenied);
+    }
   });
 
   it("lists visible agents from discovery", async () => {
@@ -1713,6 +1767,90 @@ describe("subagent discovery", () => {
     assert.match(withOverride, /model anthropic\/test-config-model/);
   });
 });
+describe("execution completion isolation", () => {
+  it("test preload cannot publish into inherited caller completion or activity files", () => {
+    const dir = mkdtempSync(join(tmpdir(), "inherited-completion-"));
+    try {
+      const sentinel = join(dir, "caller.exit");
+      writeFileSync(sentinel, "untouched");
+      const script = `
+        import assert from 'node:assert/strict';
+        import extension from './pi-extension/subagents/subagent-done.ts';
+        assert.equal(process.env.PI_SUBAGENT_SESSION, undefined);
+        assert.equal(process.env.PI_SUBAGENT_COMPLETION_FILE, undefined);
+        assert.equal(process.env.PI_SUBAGENT_ACTIVITY_FILE, undefined);
+        const tools = [];
+        extension({ on() {}, registerShortcut() {}, registerTool(tool) { tools.push(tool); } });
+        await tools.find(t => t.name === 'subagent_done').execute('', {}, undefined, undefined, { shutdown() {} });
+      `;
+      execFileSync(process.execPath, ["--import", "./test/isolate-env.ts", "--input-type=module", "-e", script], {
+        env: { ...process.env, PI_SUBAGENT_SESSION: sentinel, PI_SUBAGENT_COMPLETION_FILE: sentinel, PI_SUBAGENT_ACTIVITY_FILE: sentinel, PI_SUBAGENT_ID: "caller", PI_SUBAGENT_AUTO_EXIT: "1" },
+      });
+      assert.equal(readFileSync(sentinel, "utf8"), "untouched");
+    } finally { rmSync(dir, { recursive: true, force: true }); }
+  });
+  it("ignores stale and late artifacts from a prior run and rejects wrong execution IDs", async () => {
+    const dir = mkdtempSync(join(tmpdir(), "completion-isolation-"));
+    try {
+      const session = join(dir, "child.jsonl");
+      const completionFile = executionCompletionFile(session, "new");
+      writeFileSync(`${session}.exit`, JSON.stringify({ type: "done" }));
+      writeFileSync(executionCompletionFile(session, "old"), JSON.stringify({ type: "done", executionId: "old" }));
+      writeFileSync(completionFile, JSON.stringify({ type: "done", executionId: "old" }));
+      let ticks = 0;
+      const result = await waitForCompletion(new AbortController().signal, {
+        sessionFile: session, completionFile, executionId: "new", intervalMs: 1,
+        readTerminalTail: async () => "",
+        onTick: () => {
+          ticks++;
+          // A late finalization from the original process cannot finish this run.
+          writeFileSync(executionCompletionFile(session, "old"), JSON.stringify({ type: "done", executionId: "old" }));
+          if (ticks === 2) writeFileSync(completionFile, JSON.stringify({ type: "ping", executionId: "new", message: "new run" }));
+        },
+      });
+      assert.equal(ticks, 2);
+      assert.equal(result.reason, "ping");
+      assert.equal(result.ping?.message, "new run");
+    } finally { rmSync(dir, { recursive: true, force: true }); }
+  });
+
+  for (const toolName of ["caller_ping", "subagent_done"]) {
+    it(`${toolName} followed by settled publishes only once`, async () => {
+      const dir = mkdtempSync(join(tmpdir(), "terminal-once-"));
+      const keys = ["PI_SUBAGENT_AUTO_EXIT", "PI_SUBAGENT_SESSION", "PI_SUBAGENT_ID", "PI_SUBAGENT_COMPLETION_FILE"];
+      const previous = keys.map((key) => process.env[key]);
+      const completionFile = join(dir, "execution.exit");
+      Object.assign(process.env, { PI_SUBAGENT_AUTO_EXIT: "1", PI_SUBAGENT_SESSION: join(dir, "child.jsonl"), PI_SUBAGENT_ID: "run", PI_SUBAGENT_COMPLETION_FILE: completionFile });
+      try {
+        const { api, eventHandlers, registeredTools } = createMockExtensionApi();
+        subagentDoneExtension(api);
+        const ctx = { shutdown() {} };
+        await registeredTools.find((tool) => tool.name === toolName)!.execute("call", { message: "help" }, undefined, undefined, ctx);
+        const first = JSON.parse(readFileSync(completionFile, "utf8"));
+        assert.equal(first.executionId, "run");
+        assert.equal(first.type, toolName === "caller_ping" ? "ping" : "done");
+        rmSync(completionFile); // watcher consumed it
+        eventHandlers.get("agent_end")![0]({ messages: [{ role: "assistant", stopReason: "stop" }] }, ctx);
+        eventHandlers.get("agent_settled")![0]({}, ctx);
+        assert.equal(existsSync(completionFile), false, "settled must not recreate consumed completion");
+      } finally {
+        keys.forEach((key, i) => restoreEnvVar(key, previous[i]));
+        rmSync(dir, { recursive: true, force: true });
+      }
+    });
+  }
+
+  it("cleanup closes only an owned autonomous pane and tolerates close failure", () => {
+    const closed: string[] = [];
+    const close = (pane: string) => { closed.push(pane); };
+    cleanupDeliveredSubagentPane({ interactive: false, surface: "owned-child" }, close);
+    cleanupDeliveredSubagentPane({ interactive: true, surface: "user-driven" }, close);
+    if (process.env.HERDR_PANE_ID) cleanupDeliveredSubagentPane({ interactive: false, surface: process.env.HERDR_PANE_ID }, close);
+    assert.deepEqual(closed, ["owned-child"]);
+    assert.doesNotThrow(() => cleanupDeliveredSubagentPane({ interactive: false, surface: "gone" }, () => { throw new Error("missing"); }));
+  });
+});
+
 describe("subagent-done.ts", () => {
   describe("shouldMarkUserTookOver", () => {
     it("ignores the initial injected task before the first agent run", () => {

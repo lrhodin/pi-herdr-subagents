@@ -38,6 +38,7 @@ export interface RoutingModel {
   provider: string;
   id: string;
   reasoning: boolean;
+  name?: string;
   thinkingLevelMap?: Model<any>["thinkingLevelMap"];
   input?: string[];
   contextWindow?: number;
@@ -111,6 +112,7 @@ function toRoutingModel(value: any): RoutingModel | undefined {
     provider: value.provider,
     id: value.id,
     reasoning: value.reasoning ?? false,
+    name: typeof value.name === "string" ? value.name : undefined,
     thinkingLevelMap: value.thinkingLevelMap,
     input: Array.isArray(value.input) ? value.input : undefined,
     contextWindow: typeof value.contextWindow === "number" ? value.contextWindow : undefined,
@@ -131,7 +133,10 @@ export function wrapPiModelRegistry(registry: {
     },
     available() {
       const direct = registry.getAvailable?.() ?? [];
-      const source = direct.length > 0 ? direct : registry.getAll?.() ?? [];
+      // An empty available catalog is authoritative. Never expose unauthenticated models.
+      const source = registry.getAvailable
+        ? direct
+        : registry.hasConfiguredAuth ? registry.getAll?.() ?? [] : [];
       const models: RoutingModel[] = [];
       const seen = new Set<string>();
       for (const raw of source) {
@@ -309,7 +314,8 @@ export function buildAuthenticatedModelCatalog(
       formatTokenCount(model.contextWindow) ? `${formatTokenCount(model.contextWindow)} context` : undefined,
       formatTokenCount(model.maxTokens) ? `${formatTokenCount(model.maxTokens)} max output` : undefined,
     ].filter(Boolean);
-    lines.push(`- ${model.provider}/${model.id} — ${facts.join(", ")}`);
+    const label = model.name && model.name !== model.id ? ` (${model.name})` : "";
+    lines.push(`- ${model.provider}/${model.id}${label} — ${facts.join(", ")}`);
   }
   if (models.length === 0) lines.push("- none discovered; inherit the parent runtime");
   if (models.length > visibleModels.length) {

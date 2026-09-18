@@ -6,6 +6,7 @@ import type {
   BuiltHarnessCommand,
 } from "../types.ts";
 import type { ResolvedRuntimePlan } from "../../runtime-routing.ts";
+import { executionCompletionFile } from "../../completion.ts";
 import { serializeSubagentLineage } from "../../lineage.ts";
 import {
   buildSubagentToolAllowlist,
@@ -131,6 +132,7 @@ export class PiHarnessDriver implements HarnessDriver {
       envParts.push("PI_SUBAGENT_AUTO_EXIT=1");
     }
     envParts.push(`PI_SUBAGENT_SESSION=${shellQuote(subagentSessionFile)}`);
+    envParts.push(`PI_SUBAGENT_COMPLETION_FILE=${shellQuote(executionCompletionFile(subagentSessionFile, params.id))}`);
     envParts.push(`PI_SUBAGENT_ID=${shellQuote(params.id)}`);
     envParts.push(`PI_SUBAGENT_DEPTH=${shellQuote(String(lineage.chain.length))}`);
     envParts.push(`PI_SUBAGENT_LINEAGE=${shellQuote(serializeSubagentLineage(lineage))}`);

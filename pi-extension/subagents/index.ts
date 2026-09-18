@@ -25,7 +25,7 @@ import {
   inspectPane,
   setPaneTask,
 } from "./terminal.ts";
-import { waitForCompletion } from "./completion.ts";
+import { executionCompletionFile, waitForCompletion } from "./completion.ts";
 import {
   buildAuthenticatedModelCatalog,
   resolveRuntimePlan,
@@ -129,10 +129,12 @@ function buildSubagentRoutingGuidelines(
   return [
     ...(lineage ? [formatSubagentIdentity(lineage, { spawningAllowed })] : []),
     "Choose the named agent whose description most closely matches the task; do not use one agent as a generic default.",
+    "After collecting a finished autonomous result, close only agent-owned sessions/panes no longer needed; preserve user-driven sessions and never close caller or user-owned panes. The runtime cleans up normal autonomous completions after delivery. If autonomous work was accidentally launched interactively, collect its result then directly close its owned pane; do not spend another model turn asking it to exit. The watcher reconciles pane disappearance.",
+    "Subagents are autonomous by default. Set interactive: true ONLY when the user explicitly asks to personally drive the child conversation. A separate pane, fork, planning task, or long-running task is not an interactive handoff.",
     "Omit model and thinking when invoking a named agent so its configured defaults apply. Passing either field is an explicit one-off override and takes precedence over agent frontmatter.",
     "For a bare spawn, omit model and thinking to inherit the parent runtime.",
     "When an intentional runtime override is necessary, prefer changing thinking before changing models: minimal/low for bounded mechanical work, medium for ordinary implementation or review, and high+ for architecture, concurrency, security, or hard diagnosis.",
-    "When overriding a subagent model, use an exact authenticated provider/model-id from the live catalog below. Do not invent aliases or fuzzy names.",
+    "When overriding a subagent model, use an exact authenticated provider/model-id from the live catalog below. Use list_models to resolve model nicknames or discover models omitted here. Do not invent aliases or fuzzy names.",
     agentCatalog ?? "Available named subagent catalog becomes available after session start.",
     modelCatalog ?? "Authenticated subagent model catalog becomes available after session start.",
   ];
@@ -170,7 +172,7 @@ const SubagentParams = Type.Object({
   model: Type.Optional(
     Type.String({
       description:
-        "Exact authenticated provider/model-id. Omit to use a named agent's model default, then the configured or parent model. Passing a value explicitly overrides agent frontmatter for this spawn.",
+        "Exact authenticated provider/model-id from list_models; use list_models to resolve nicknames before overriding. Omit to use a named agent's model default, then the configured or parent model. Passing a value explicitly overrides agent frontmatter for this spawn.",
     }),
   ),
   thinking: Type.Optional(ThinkingLevelSchema),
@@ -195,7 +197,7 @@ const SubagentParams = Type.Object({
   interactive: Type.Optional(
     Type.Boolean({
       description:
-        "Mark the subagent as interactive (long-running, user drives the conversation in its own pane). When true, the main session is not woken by status transitions (stalled/recovered) for this subagent. If omitted, falls back to the agent's `interactive` frontmatter, otherwise the inverse of `auto-exit` (agents that auto-exit are autonomous and get stall pings; agents that don't are interactive and stay quiet).",
+        "Defaults to false. Set true ONLY when the user explicitly asks to personally drive the child conversation in its pane. Do not enable for ordinary delegation, planning, forks, or long-running work. True keeps the child open for user input and suppresses parent stalled/recovered notifications.",
     }),
   ),
   resumeSessionId: Type.Optional(
@@ -449,41 +451,25 @@ function resolveLaunchBehavior(
   };
 }
 
-/**
- * Decide whether a subagent is interactive (user-driven, long-running).
- *
- * Resolution order:
- *   1. Explicit `interactive` tool parameter wins.
- *   2. Explicit `interactive` frontmatter field on the agent.
- *   3. Default: the inverse of `auto-exit`. Agents that auto-exit are
- *      autonomous (scout, worker, reviewer) and the parent session should be
- *      woken on stall/recovery transitions. Agents that don't auto-exit are
- *      driven by the user in their own pane (planner, iterate/fork) and
- *      stall pings are noise.
- *
- * When no agent defs exist at all (bare `subagent({ name, task })` call,
- * typical for `/iterate` with `fork: true`), `autoExit` is undefined and the
- * subagent is treated as interactive — matching the intent of iterate.
- */
+/** User-driven sessions require an explicit per-spawn opt-in. */
 function resolveEffectiveAutoExit(
   params: Static<typeof SubagentParams>,
   agentDefs: AgentDefaults | null,
 ): boolean {
-  // Named agents preserve their declared behavior. Bare tool calls are
-  // autonomous by default, including full-context forks: `fork` controls
-  // context inheritance, not whether the child should remain open. Interactive
-  // flows such as /iterate opt out explicitly with `interactive: true`.
+  // An explicit user handoff must stay open even for an auto-exit agent.
+  if (params.interactive === true) return false;
+  // Named agents retain their completion mechanism; this does not imply
+  // user control or disable parent supervision.
   if (agentDefs) return agentDefs.autoExit ?? false;
   return params.interactive !== true;
 }
 
 function resolveEffectiveInteractive(
   params: Static<typeof SubagentParams>,
-  agentDefs: AgentDefaults | null,
+  _agentDefs: AgentDefaults | null,
 ): boolean {
-  if (params.interactive != null) return params.interactive;
-  if (agentDefs?.interactive != null) return agentDefs.interactive;
-  return !resolveEffectiveAutoExit(params, agentDefs);
+  // Legacy frontmatter is parsed for compatibility, not taken as user consent.
+  return params.interactive ?? false;
 }
 
 function loadAgentDefaults(agentName: string): AgentDefaults | null {
@@ -1241,9 +1227,11 @@ async function launchSubagent(
   // Build the task message
   // Only full-context fork mode inherits prior conversation state.
   // Blank-session modes need the wrapper instructions and artifact-backed handoff.
-  const modeHint = effectiveAutoExit
-    ? "Complete your task autonomously."
-    : "Complete your task. When finished, call the subagent_done tool. The user can interact with you at any time.";
+  const modeHint = effectiveInteractive
+    ? "The user will personally drive this conversation. Keep the session open for their input; do not call subagent_done unless they ask you to finish."
+    : effectiveAutoExit
+      ? "Complete your task autonomously."
+      : "Complete your task autonomously. When finished, call the subagent_done tool.";
   const summaryInstruction = effectiveAutoExit
     ? "Your FINAL assistant message should summarize what you accomplished."
     : "Your FINAL assistant message (before calling subagent_done or before the user exits) should summarize what you accomplished.";
@@ -1336,6 +1324,16 @@ async function launchSubagent(
  * the summary from the session file, cleans up the surface,
  * and removes the entry from runningSubagents.
  */
+export function cleanupDeliveredSubagentPane(
+  running: Pick<RunningSubagent, "interactive" | "surface">,
+  close: (surface: string) => void = closePane,
+): void {
+  if (running.interactive || running.surface === process.env.HERDR_PANE_ID) return;
+  // Only extension-created RunningSubagent surfaces are passed here. Cleanup
+  // failure must not turn a safely delivered result into a duplicate error.
+  try { close(running.surface); } catch {}
+}
+
 async function watchSubagent(
   running: RunningSubagent,
   signal: AbortSignal,
@@ -1346,6 +1344,10 @@ async function watchSubagent(
     const result = await waitForCompletion(signal, {
       intervalMs: 1000,
       sessionFile,
+      ...(!running.cli || running.cli === "pi" ? {
+        completionFile: executionCompletionFile(sessionFile, running.id),
+        executionId: running.id,
+      } : {}),
       sentinelFile: running.sentinelFile,
       readTerminalTail: () => readPaneAsync(surface, 5),
       inspectPane: async () => inspectPane(surface),
@@ -1376,7 +1378,6 @@ async function watchSubagent(
       });
 
       if (extracted) {
-        closePane(surface);
         running.lifecycle = result.exitCode === 0
           ? markCompleted(running.lifecycle, Date.now())
           : markFailed(running.lifecycle, result.errorMessage ?? extracted.summary, Date.now(), result.exitCode);
@@ -1438,7 +1439,6 @@ async function watchSubagent(
           : "Sub-agent exited without output";
     }
 
-    closePane(surface);
     running.lifecycle = result.exitCode === 0
       ? markCompleted(running.lifecycle, Date.now())
       : markFailed(running.lifecycle, result.errorMessage ?? summary, Date.now(), result.exitCode);
@@ -1454,9 +1454,6 @@ async function watchSubagent(
       ...(result.errorMessage ? { errorMessage: result.errorMessage } : {}),
     };
   } catch (err: any) {
-    try {
-      closePane(surface);
-    } catch {}
     running.lifecycle = markFailed(
       running.lifecycle,
       signal.aborted ? "Subagent cancelled." : err?.message ?? String(err),
@@ -1629,9 +1626,6 @@ export default function subagentsExtension(pi: ExtensionAPI) {
               updateWidget();
               return;
             }
-            running.lifecycle = markDelivery(running.lifecycle, "delivered");
-            runningSubagents.delete(running.id);
-            updateWidget();
             const completionApi = selectCompletionApi(pi, runtime.pi);
 
             if (result.ping) {
@@ -1651,6 +1645,10 @@ export default function subagentsExtension(pi: ExtensionAPI) {
                 },
                 { triggerTurn: true, deliverAs: "steer" },
               );
+              running.lifecycle = markDelivery(running.lifecycle, "delivered");
+              runningSubagents.delete(running.id);
+              updateWidget();
+              cleanupDeliveredSubagentPane(running);
               return;
             }
 
@@ -1680,6 +1678,10 @@ export default function subagentsExtension(pi: ExtensionAPI) {
               },
               { triggerTurn: true, deliverAs: "steer" },
             );
+            running.lifecycle = markDelivery(running.lifecycle, "delivered");
+            runningSubagents.delete(running.id);
+            updateWidget();
+            cleanupDeliveredSubagentPane(running);
           })
           .catch((err) => {
             if (!shouldDeliverSubagentCompletion(running)) {
@@ -1688,9 +1690,6 @@ export default function subagentsExtension(pi: ExtensionAPI) {
               updateWidget();
               return;
             }
-            running.lifecycle = markDelivery(running.lifecycle, "delivered");
-            runningSubagents.delete(running.id);
-            updateWidget();
             selectCompletionApi(pi, runtime.pi).sendMessage(
               {
                 customType: "subagent_result",
@@ -1700,6 +1699,10 @@ export default function subagentsExtension(pi: ExtensionAPI) {
               },
               { triggerTurn: true, deliverAs: "steer" },
             );
+            running.lifecycle = markDelivery(running.lifecycle, "delivered");
+            runningSubagents.delete(running.id);
+            updateWidget();
+            cleanupDeliveredSubagentPane(running);
           });
 
         // Return immediately
@@ -1842,6 +1845,32 @@ export default function subagentsExtension(pi: ExtensionAPI) {
       },
     });
 
+  // ── list_models tool ──
+  if (shouldRegister("list_models"))
+    pi.registerTool({
+      name: "list_models",
+      label: "List Models",
+      description:
+        "List Pi's live authenticated models with exact provider/model-id, display names, and capabilities. " +
+        "Resolve model nicknames here before setting subagent.model. No inference or configuration changes. " +
+        "Returns up to 100 models; narrow query if models are omitted.",
+      promptSnippet: "List authenticated models and resolve nicknames to exact subagent model IDs",
+      parameters: Type.Object({
+        query: Type.Optional(Type.String({ description: "Case-insensitive substring of provider/model-id or display name; omit to list models" })),
+      }),
+      async execute(_id, params, _signal, _onUpdate, ctx) {
+        const registry = wrapPiModelRegistry(ctx.modelRegistry);
+        const query = params.query?.trim().toLowerCase() ?? "";
+        const models = registry.available().filter((model) =>
+          `${model.provider}/${model.id} ${model.name ?? ""}`.toLowerCase().includes(query),
+        );
+        return {
+          content: [{ type: "text", text: buildAuthenticatedModelCatalog({ ...registry, available: () => models }, 100) }],
+          details: { count: models.length },
+        };
+      },
+    });
+
   // ── subagents_list tool ──
   if (shouldRegister("subagents_list"))
     pi.registerTool({
@@ -1930,7 +1959,7 @@ export default function subagentsExtension(pi: ExtensionAPI) {
         autoExit: Type.Optional(
           Type.Boolean({
             description:
-              "Whether the resumed session should automatically exit after completing its response. Defaults to true for autonomous follow-up work; set false for interactive resumed sessions.",
+              "Whether the resumed session should automatically exit after completing its response. Defaults to true. Set false ONLY when the user explicitly asks to personally drive the resumed conversation.",
           }),
         ),
       }),
@@ -2093,6 +2122,7 @@ export default function subagentsExtension(pi: ExtensionAPI) {
           resumeEnvParts.push(`PI_SUBAGENT_AGENT=${shellQuote(retainedAgent)}`);
         }
         resumeEnvParts.push(`PI_SUBAGENT_SESSION=${shellQuote(params.sessionPath)}`);
+        resumeEnvParts.push(`PI_SUBAGENT_COMPLETION_FILE=${shellQuote(executionCompletionFile(params.sessionPath, id))}`);
         resumeEnvParts.push(`PI_SUBAGENT_ID=${shellQuote(id)}`);
         resumeEnvParts.push(`PI_SUBAGENT_DEPTH=${shellQuote(String(resumeLineage.chain.length))}`);
         resumeEnvParts.push(`PI_SUBAGENT_LINEAGE=${shellQuote(serializeSubagentLineage(resumeLineage))}`);
@@ -2157,9 +2187,6 @@ export default function subagentsExtension(pi: ExtensionAPI) {
               updateWidget();
               return;
             }
-            running.lifecycle = markDelivery(running.lifecycle, "delivered");
-            runningSubagents.delete(running.id);
-            updateWidget();
             const completionApi = selectCompletionApi(pi, runtime.pi);
 
             if (result.ping) {
@@ -2177,6 +2204,10 @@ export default function subagentsExtension(pi: ExtensionAPI) {
                 },
                 { triggerTurn: true, deliverAs: "steer" },
               );
+              running.lifecycle = markDelivery(running.lifecycle, "delivered");
+              runningSubagents.delete(running.id);
+              updateWidget();
+              cleanupDeliveredSubagentPane(running);
               return;
             }
 
@@ -2214,6 +2245,10 @@ export default function subagentsExtension(pi: ExtensionAPI) {
               },
               { triggerTurn: true, deliverAs: "steer" },
             );
+            running.lifecycle = markDelivery(running.lifecycle, "delivered");
+            runningSubagents.delete(running.id);
+            updateWidget();
+            cleanupDeliveredSubagentPane(running);
           })
           .catch((err) => {
             if (!shouldDeliverSubagentCompletion(running)) {
@@ -2222,9 +2257,6 @@ export default function subagentsExtension(pi: ExtensionAPI) {
               updateWidget();
               return;
             }
-            running.lifecycle = markDelivery(running.lifecycle, "delivered");
-            runningSubagents.delete(running.id);
-            updateWidget();
             selectCompletionApi(pi, runtime.pi).sendMessage(
               {
                 customType: "subagent_result",
@@ -2234,6 +2266,10 @@ export default function subagentsExtension(pi: ExtensionAPI) {
               },
               { triggerTurn: true, deliverAs: "steer" },
             );
+            running.lifecycle = markDelivery(running.lifecycle, "delivered");
+            runningSubagents.delete(running.id);
+            updateWidget();
+            cleanupDeliveredSubagentPane(running);
           });
 
         return {

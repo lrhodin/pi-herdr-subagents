@@ -64,6 +64,8 @@ export function buildSubagentToolAllowlist(
 
   const allow = new Set(requested);
   for (const tool of SUBAGENT_CONTROL_TOOLS) allow.add(tool);
+  // Read-only discovery remains available even when recursive spawning is disabled.
+  allow.add("list_models");
   if (spawning) {
     for (const tool of SUBAGENT_MANAGEMENT_TOOLS) allow.add(tool);
   }

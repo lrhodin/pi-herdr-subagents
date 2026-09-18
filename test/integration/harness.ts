@@ -288,6 +288,7 @@ export function startPi(
     `pi`,
     `-ne`,
     `-e ${shellQuote(EXTENSION_SOURCE)}`,
+    process.env.PI_TEST_PROVIDER_EXTENSION ? `-e ${shellQuote(process.env.PI_TEST_PROVIDER_EXTENSION)}` : "",
     `--model ${shellQuote(model)}`,
     extra,
     shellQuote(task),
@@ -295,7 +296,10 @@ export function startPi(
     .filter(Boolean)
     .join(" ");
 
-  runScriptInPane(surface, `${cmd}; echo '__TEST_DONE_'$?'__'`, {
+  // Pane shells may inherit the invoking agent's identity from the Herdr server.
+  // These are independent test parents, not descendants of the developer session.
+  const isolate = `for key in \${!PI_SUBAGENT_@}; do [[ "$key" == PI_SUBAGENT_SHELL_READY_DELAY_MS ]] || unset "$key"; done; unset PI_DENY_TOOLS PI_AGENT_NAME`;
+  runScriptInPane(surface, `${isolate}; ${cmd}; echo '__TEST_DONE_'$?'__'`, {
     scriptPath: join(testDir, `test-launch-${Date.now()}.sh`),
   });
 }

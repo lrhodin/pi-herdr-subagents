@@ -21,6 +21,9 @@ export interface CompletionOptions {
     observedAt: number,
   ) => void;
   sessionFile?: string;
+  /** Execution-scoped artifact, never shared by a resumed run. */
+  completionFile?: string;
+  executionId?: string;
   sentinelFile?: string;
   onTick?: (elapsedSeconds: number) => void;
 }
@@ -61,16 +64,20 @@ export function interpretExitSidecar(data: unknown): CompletionResult {
   };
 }
 
-function consumeExitSidecar(sessionFile: string | undefined): CompletionResult | null {
-  if (!sessionFile) return null;
+export function executionCompletionFile(sessionFile: string, executionId: string): string {
+  return `${sessionFile}.${executionId}.exit`;
+}
 
-  const exitFile = `${sessionFile}.exit`;
+function consumeExitSidecar(options: CompletionOptions): CompletionResult | null {
+  const exitFile = options.completionFile ?? (options.sessionFile ? `${options.sessionFile}.exit` : undefined);
+  if (!exitFile) return null;
   if (!existsSync(exitFile)) return null;
 
   try {
-    const result = interpretExitSidecar(JSON.parse(readFileSync(exitFile, "utf8")));
+    const payload = JSON.parse(readFileSync(exitFile, "utf8"));
     rmSync(exitFile, { force: true });
-    return result;
+    if (options.executionId && payload.executionId !== options.executionId) return null;
+    return interpretExitSidecar(payload);
   } catch {
     // The child may still be writing the file. Retry on the next polling cycle.
     return null;
@@ -83,7 +90,7 @@ function terminalExitCode(screen: string): number | null {
 }
 
 function completionArtifact(options: CompletionOptions): CompletionResult | null {
-  const sidecar = consumeExitSidecar(options.sessionFile);
+  const sidecar = consumeExitSidecar(options);
   if (sidecar) return sidecar;
   if (options.sentinelFile && existsSync(options.sentinelFile)) {
     return { reason: "sentinel", exitCode: 0 };
@@ -134,7 +141,7 @@ export async function waitForCompletion(
   for (;;) {
     if (signal.aborted) throw new Error(ABORT_MESSAGE);
 
-    const sidecarResult = consumeExitSidecar(options.sessionFile);
+    const sidecarResult = consumeExitSidecar(options);
     if (sidecarResult) return sidecarResult;
 
     if (options.sentinelFile && existsSync(options.sentinelFile)) {
