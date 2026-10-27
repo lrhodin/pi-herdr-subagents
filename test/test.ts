@@ -2380,7 +2380,7 @@ describe("completion.ts", () => {
     assert.deepEqual(result, {
       reason: "error",
       exitCode: 1,
-      errorMessage: "Subagent pane disappeared before completion evidence was recorded.",
+      errorMessage: "Subagent pane disappeared before completion evidence was recorded. If the user closed an interactive pane, its session file is intact: summarize it instead of retrying.",
     });
   });
 

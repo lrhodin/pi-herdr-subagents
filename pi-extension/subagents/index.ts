@@ -1228,7 +1228,7 @@ async function launchSubagent(
   // Only full-context fork mode inherits prior conversation state.
   // Blank-session modes need the wrapper instructions and artifact-backed handoff.
   const modeHint = effectiveInteractive
-    ? "The user will personally drive this conversation. Keep the session open for their input; do not call subagent_done unless they ask you to finish."
+    ? "The user will personally drive this conversation. Keep the session open for their input. Tell them once, early: say \"done\" to hand a summary back to the parent; closing the pane loses it. When they say they are done or ask to wrap up, reply with a short summary for the parent (decisions, writes made, open loops) and call subagent_done."
     : effectiveAutoExit
       ? "Complete your task autonomously."
       : "Complete your task autonomously. When finished, call the subagent_done tool.";
