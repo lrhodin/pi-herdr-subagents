@@ -249,6 +249,11 @@ export function sendHerdrCommand(surface: string, command: string): void {
   herdrExec(["pane", "run", surface, command]);
 }
 
+/** Raw `herdr pane list` JSON. */
+export function listHerdrPanesRaw(): string {
+  return herdrExec(["pane", "list"]);
+}
+
 export function sendHerdrEscape(surface: string): void {
   herdrExec(["pane", "send-keys", surface, "Escape"]);
 }

@@ -26,6 +26,8 @@ import {
   setPaneTask,
 } from "./terminal.ts";
 import { executionCompletionFile, waitForCompletion } from "./completion.ts";
+import { listHerdrPanesRaw, sendHerdrCommand } from "./herdr.ts";
+import { isRestoredOrphan, orphanActiveTools, registerOrphanTools } from "./orphan.ts";
 import {
   buildAuthenticatedModelCatalog,
   resolveRuntimePlan,
@@ -1486,6 +1488,17 @@ async function watchSubagent(
 
 export default function subagentsExtension(pi: ExtensionAPI) {
   runtime.pi = pi;
+  let orphanToolsRegistered = false;
+  let orphanPolicy: ReturnType<typeof readSubagentPolicyFromSessionFile> = null;
+  // Late registrations (MCP servers) activate themselves, so re-apply the
+  // restored orphan's allowlist before every turn, not just at session_start.
+  const applyOrphanAllowlist = () => {
+    const active = orphanActiveTools(orphanPolicy, pi.getAllTools().map((tool) => tool.name));
+    if (active) pi.setActiveTools(active);
+  };
+  pi.on("before_agent_start", () => {
+    if (orphanPolicy) applyOrphanAllowlist();
+  });
 
   // Capture the UI context for widget updates and restore presentation for
   // subagents whose watchers survived a reload.
@@ -1502,6 +1515,18 @@ export default function subagentsExtension(pi: ExtensionAPI) {
     const spawningAllowed = process.env.PI_SUBAGENT_ID
       ? inheritedSpawningAllowed
       : persistedPolicy?.spawning ?? true;
+    // A subagent herdr restored after a reboot lost its -e/--tools/env and its
+    // parent's watcher. Give it completion tools that hand off to the parent pane.
+    if (!orphanToolsRegistered && isRestoredOrphan(persistedLineage)) {
+      orphanToolsRegistered = true;
+      registerOrphanTools(pi, persistedLineage, {
+        listPanes: listHerdrPanesRaw,
+        runInPane: sendHerdrCommand,
+        currentPane: () => process.env.HERDR_PANE_ID,
+      });
+      orphanPolicy = persistedPolicy;
+      applyOrphanAllowlist();
+    }
     runtime.currentLineage = inheritedLineage ?? persistedLineage ?? (
       currentSessionFile && currentSessionId
         ? createRootLineage(currentSessionId, currentSessionFile)
